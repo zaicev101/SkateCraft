@@ -27,6 +27,8 @@ pub mod wow_flags {
     pub const MOUNTED: u32 = 1 << 1;
     pub const IN_COMBAT: u32 = 1 << 2;
     pub const CHAT_OPEN: u32 = 1 << 3;
+    /// The player switched skate mode on (the in-game addon says so, see `Header::skate_on`).
+    pub const SKATE_ON: u32 = 1 << 4;
 }
 
 /// Capability flags in [`GuestState::flags`].
@@ -46,6 +48,12 @@ pub struct Header {
     /// GetTickCount64 of the last beat; a side that stops beating is treated as dead.
     pub wow_heartbeat_ms: u64,
     pub guest_heartbeat_ms: u64,
+    /// Set by the proxy when the addon's message passes through the client's network send:
+    /// 1 = skate mode on, 0 = off; `skate_seen_ms` is when it was last heard (the addon repeats it
+    /// every couple of seconds while on, so silence means off).
+    pub skate_on: u32,
+    pub pad_h: u32,
+    pub skate_seen_ms: u64,
 }
 
 /// WoW -> guest. The player as the client sees it.
@@ -152,6 +160,13 @@ impl Shared {
     }
     pub fn header(&self) -> Header {
         unsafe { ptr::read_volatile(self.header_ptr()) }
+    }
+    pub fn set_skate(&self, on: bool, ms: u64) {
+        unsafe {
+            let h = self.header_ptr();
+            ptr::write_volatile(ptr::addr_of_mut!((*h).skate_on), on as u32);
+            ptr::write_volatile(ptr::addr_of_mut!((*h).skate_seen_ms), ms);
+        }
     }
     pub fn set_wow_beat(&self, pid: u32, ms: u64) {
         unsafe {

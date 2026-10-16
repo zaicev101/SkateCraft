@@ -1,0 +1,9 @@
+{
+  "id": "skatecraft-test-push",
+  "api": 2,
+  "name": "SkateCraft push test",
+  "version": "0.1.0",
+  "author": "skatecraft",
+  "description": "Test only: one short push on flat ground, then logs the skater's speed and position every half second.",
+  "entry": "main.lua"
+}

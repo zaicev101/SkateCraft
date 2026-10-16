@@ -1,0 +1,6 @@
+## Interface: 30300
+## Title: SkateCraft
+## Notes: Switch skate mode on and off (works with the SkateCraft client plugin).
+## Author: SkateCraft
+## Version: 0.1.0
+SkateCraft.lua

@@ -22,6 +22,7 @@ dependencies = [
 name = "skatecraft-host-wow"
 version = "0.1.0"
 dependencies = [
+ "skatecraft-protocol",
  "windows-sys",
 ]
 

@@ -94,6 +94,7 @@ unsafe extern "system" fn watcher(_: *mut c_void) -> u32 {
     let mut seen = None;
     let mut generation = 0u32;
     note(&dir, "loader started");
+    note(&dir, if hook_send_import() { "network hook installed" } else { "network hook NOT installed" });
     loop {
         let m = mtime(&src);
         if m.is_some() && m != seen {
@@ -146,4 +147,82 @@ pub unsafe extern "system" fn DllMain(_h: HINSTANCE, reason: u32, _: *mut c_void
         }
     }
     TRUE
+}
+
+// ---------------------------------------------------------------- addon channel
+// The in-game addon cannot call into this DLL, so it talks through the network: it sends the
+// addon message "SKATECRAFT\tON" / "SKATECRAFT\tOFF" to the player's own name. The text travels in
+// plain bytes inside the outgoing packet (only the 6-byte packet header is encrypted), so this DLL
+// looks for it in `send` and records the request in the shared region for the core. Wow.exe
+// imports ws2_32 by ordinal (send = 19): its import table slot is replaced with `hook_send`.
+
+use skatecraft_protocol::Shared;
+use std::sync::Mutex;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_READWRITE};
+
+static SHARED: Mutex<Option<Shared>> = Mutex::new(None);
+static REAL_SEND: AtomicIsize = AtomicIsize::new(0);
+
+type FnSend = unsafe extern "system" fn(usize, *const u8, i32, i32) -> i32;
+
+fn find(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+unsafe extern "system" fn hook_send(s: usize, buf: *const u8, len: i32, flags: i32) -> i32 {
+    if !buf.is_null() && len > 12 && len < 512 {
+        let data = core::slice::from_raw_parts(buf, len as usize);
+        let on = find(data, b"SKATECRAFT\tON");
+        let off = !on && find(data, b"SKATECRAFT\tOFF");
+        if on || off {
+            if let Ok(mut g) = SHARED.lock() {
+                if g.is_none() {
+                    *g = Shared::create().ok();
+                }
+                if let Some(sh) = g.as_ref() {
+                    sh.set_skate(on, skatecraft_protocol::tick_ms());
+                }
+            }
+        }
+    }
+    let real = REAL_SEND.load(Ordering::Acquire);
+    if real == 0 {
+        return -1;
+    }
+    core::mem::transmute::<_, FnSend>(real)(s, buf, len, flags)
+}
+
+/// Replace the ws2_32 `send` slot (ordinal 19) in Wow.exe's import table.
+unsafe fn hook_send_import() -> bool {
+    let base = GetModuleHandleW(ptr::null()) as usize;
+    if base == 0 {
+        return false;
+    }
+    let rd32 = |a: usize| *(a as *const u32);
+    let nt = base + rd32(base + 0x3C) as usize;
+    let imports = base + rd32(nt + 0x80) as usize; // IMAGE_DIRECTORY_ENTRY_IMPORT (32-bit)
+    let mut d = imports;
+    while rd32(d + 12) != 0 {
+        let name = core::ffi::CStr::from_ptr((base + rd32(d + 12) as usize) as *const i8).to_string_lossy().to_ascii_lowercase();
+        if name == "ws2_32.dll" {
+            let mut orig = base + rd32(d) as usize; // OriginalFirstThunk
+            let mut slot = base + rd32(d + 16) as usize; // FirstThunk
+            while rd32(orig) != 0 {
+                let v = rd32(orig);
+                if v & 0x8000_0000 != 0 && (v & 0xFFFF) == 19 {
+                    let mut old = 0u32;
+                    VirtualProtect(slot as _, 4, PAGE_READWRITE, &mut old);
+                    REAL_SEND.store(rd32(slot) as isize, Ordering::Release);
+                    *(slot as *mut u32) = hook_send as usize as u32;
+                    VirtualProtect(slot as _, 4, old, &mut old);
+                    return true;
+                }
+                orig += 4;
+                slot += 4;
+            }
+        }
+        d += 20;
+    }
+    false
 }

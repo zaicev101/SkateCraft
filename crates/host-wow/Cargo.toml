@@ -11,4 +11,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 windows-sys = { workspace = true }
+skatecraft-protocol = { path = "../protocol" }
 

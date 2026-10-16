@@ -1,0 +1,67 @@
+-- SkateCraft: a button and /skate to switch skate mode on and off.
+-- The addon cannot talk to the client plugin directly, so it sends the addon message
+-- "SKATECRAFT\tON" / "SKATECRAFT\tOFF" to the player's own name: the plugin sees it in the client's
+-- network send. While skate mode is on the message is repeated every 2 seconds, so a plugin that
+-- (re)loads or a logout switches it off by itself.
+local PREFIX = "SKATECRAFT"
+local on = false
+local elapsed = 0
+
+local function send(state)
+    local me = UnitName("player")
+    if me then
+        SendAddonMessage(PREFIX, state and "ON" or "OFF", "WHISPER", me)
+    end
+end
+
+local button = CreateFrame("Button", "SkateCraftButton", UIParent, "UIPanelButtonTemplate")
+button:SetWidth(96)
+button:SetHeight(24)
+button:SetPoint("TOP", UIParent, "TOP", 0, -90)
+button:SetMovable(true)
+button:EnableMouse(true)
+button:RegisterForDrag("RightButton")
+button:SetScript("OnDragStart", function(self) self:StartMoving() end)
+button:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
+
+local function refresh()
+    button:SetText(on and "Skate: ON" or "Skate: off")
+end
+
+local function set(state)
+    on = state and true or false
+    elapsed = 0
+    send(on)
+    refresh()
+    DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffSkateCraft|r: skate mode " .. (on and "ON" or "off"))
+end
+
+button:SetScript("OnClick", function() set(not on) end)
+button:SetScript("OnEnter", function(self)
+    GameTooltip:SetOwner(self, "ANCHOR_BOTTOM")
+    GameTooltip:SetText("SkateCraft", 1, 1, 1)
+    GameTooltip:AddLine("Click or /skate: switch skate mode on or off. Right-drag moves the button.", 0.8, 0.82, 0.88, true)
+    GameTooltip:Show()
+end)
+button:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+button:SetScript("OnUpdate", function(_, dt)
+    if not on then return end
+    elapsed = elapsed + dt
+    if elapsed >= 2 then
+        elapsed = 0
+        send(true)
+    end
+end)
+
+SLASH_SKATECRAFT1 = "/skate"
+SlashCmdList["SKATECRAFT"] = function(msg)
+    msg = string.lower(msg or "")
+    if msg == "on" then set(true) elseif msg == "off" then set(false) else set(not on) end
+end
+
+local f = CreateFrame("Frame")
+f:RegisterEvent("PLAYER_LOGOUT")
+f:SetScript("OnEvent", function() if on then send(false) end end)
+
+refresh()

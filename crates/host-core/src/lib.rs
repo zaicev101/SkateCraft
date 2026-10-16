@@ -75,6 +75,21 @@ pub unsafe extern "C" fn sc_stop() {
     }
 }
 
+/// Start the Skate engine (tools\run-engine.ps1) hidden. The project folder is the parent of the data folder.
+fn spawn_engine(data: &str) {
+    use std::os::windows::process::CommandExt;
+    let root = data.rsplit_once('\\').map(|x| x.0).unwrap_or(data);
+    let script = format!("{root}\\tools\\run-engine.ps1");
+    match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &script])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .spawn()
+    {
+        Ok(_) => log("skate mode: starting the engine"),
+        Err(e) => log(&format!("skate mode: could not start the engine: {e}")),
+    }
+}
+
 unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     log("core started");
     let shared = match Shared::create() {
@@ -100,12 +115,13 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut block_seq = 0u32;
     let mut acc = (0.0f64, 0.0f64, 0.0f64);
     let mut last_iter = Instant::now();
+    let mut last_spawn = 0u64;
     let (mut drift_sum, mut drift_max, mut drift_n) = (0.0f64, 0.0f32, 0u32);
     while !STOP.load(Ordering::SeqCst) {
         let now = GetTickCount64();
         shared.set_wow_beat(pid, now);
         frame = frame.wrapping_add(1);
-        let state = wow::read_player(frame).unwrap_or(WowState { frame, ..Default::default() });
+        let mut state = wow::read_player(frame).unwrap_or(WowState { frame, ..Default::default() });
         let dt = {
             let n = Instant::now();
             let d = n.duration_since(last_iter).as_secs_f32().min(0.1);
@@ -114,15 +130,28 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         };
 
         let hdr = shared.header();
+        // the addon's request (repeated every couple of seconds while skate mode is on)
+        let skate_requested = hdr.skate_on != 0 && now.saturating_sub(hdr.skate_seen_ms) < 6000;
+        if skate_requested {
+            state.flags |= wow_flags::SKATE_ON;
+        }
         let guest_alive = hdr.guest_heartbeat_ms != 0 && now.saturating_sub(hdr.guest_heartbeat_ms) < 1000;
         if guest_alive && !guest_seen {
             log(&format!("guest attached (pid {})", hdr.guest_pid));
         }
         guest_seen = guest_alive;
+        // skate mode asked for but no Skate engine is running: start it (at most every 25 s)
+        if skate_requested && !guest_alive && now.saturating_sub(last_spawn) > 25_000 {
+            last_spawn = now;
+            spawn_engine(&data);
+        }
 
         // the guest drives the player: puppet it
         let g = shared.read_guest();
-        let want = guest_alive && g.flags & guest_flags::DRIVING != 0 && state.flags & wow_flags::IN_WORLD != 0;
+        let want = guest_alive
+            && skate_requested
+            && g.flags & guest_flags::DRIVING != 0
+            && state.flags & wow_flags::IN_WORLD != 0;
         if want != driving {
             driving = want;
             log(if driving { "puppet on" } else { "puppet off" });
