@@ -9,6 +9,6 @@ $assets = Join-Path $eng "target\release-packages\$Package\skate3rust-windows-x6
 Stop-Process -Name skate3rust -Force -ErrorAction SilentlyContinue
 $env:SKATECRAFT_BRIDGE = '1'
 if ($Drive) { $env:SKATECRAFT_DRIVE = '1' } else { Remove-Item Env:SKATECRAFT_DRIVE -ErrorAction SilentlyContinue }
-Start-Process -FilePath "$rel\skate3rust.exe" -ArgumentList '--assets', "`"$($assets.Path)`"" -WorkingDirectory $rel `
+Start-Process -FilePath "$rel\skate3rust.exe" -ArgumentList '--assets', "`"$($assets.Path)`"", '--test-world', '--mute' -WorkingDirectory $rel `
     -RedirectStandardOutput (Join-Path $PSScriptRoot '..\engine-run.log') -RedirectStandardError (Join-Path $PSScriptRoot '..\engine-run.err')
 'engine started'

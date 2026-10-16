@@ -64,6 +64,13 @@ pub struct WowState {
     pub pitch: f32,
     pub speed: f32,
     pub reserved: f32,
+    /// Where the host actually put the character after its collision (WoW units), and a counter
+    /// that advances each time the guest's wish was blocked: the guest pulls the skater back.
+    pub ax: f64,
+    pub ay: f64,
+    pub az: f64,
+    pub block_seq: u32,
+    pub pad2: u32,
 }
 
 /// guest -> WoW. Where the skater wants the player to be.

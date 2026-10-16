@@ -176,3 +176,21 @@ pub fn release(player: usize) {
         }
     }
 }
+
+/// Run speed (yards/s) stored in the movement object (+0x8C, 7.0 for a normal run).
+pub const MOVE_SPEED: usize = 0x8C;
+
+pub fn get_speed(player: usize) -> Option<f32> {
+    read(movement_ptr(player)? + MOVE_SPEED)
+}
+
+pub fn set_speed(player: usize, v: f32) {
+    if let Some(m) = movement_ptr(player) {
+        write(m + MOVE_SPEED, v);
+    }
+}
+
+/// Current cached unit position.
+pub fn read_pos(player: usize) -> Option<(f32, f32, f32)> {
+    Some((read(player + UNIT_POS)?, read(player + UNIT_POS + 4)?, read(player + UNIT_POS + 8)?))
+}

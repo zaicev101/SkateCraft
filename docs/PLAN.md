@@ -38,5 +38,6 @@ recompilation `mchughalex/skate3recomp` (no extension API, license not stated).
 - [x] E3a: puppet movement in the client verified: a fake guest walking a circle moves the character (CMovement +0x10/+0x4C position, +0x20/+0x58 facing, +0x44 flags bit0 = forward so the client keeps sending heartbeats) and the server's `.gps` follows.
 - [ ] E3b: camera follow.
 - [x] E3c: end-to-end unattended test: engine autopilot (Lua mod, no gamepad) -> bridge -> puppet; the WoW character runs a curve over Northshire terrain, z = server ground height each frame (see tools/run-engine.ps1 -Drive).
+- [x] E5a (geometry priority): the host decides where the character can be: walls from vmap triangles stop/slide it, floors from vmap then terrain, fall towards lower floors; the guest pulls the skater back on every block (block_seq). Verified at the Cathedral of Light: floor 106.519 vs player 106.518, character stops at the wall. The Skate side runs `--test-world` (empty plane) so its own walls never matter.
 - [ ] E4: overlay composite (readback first, then shared texture with depth).
 - [ ] E5: collision streaming into Rapier bodies, input routing, polish.
