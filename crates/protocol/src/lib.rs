@@ -25,6 +25,8 @@ pub const OFF_PATCH: usize = 0x1000;
 pub const PATCH_MAX_TRIS: usize = 24000;
 /// The skater's pose (guest -> host), for the host to retarget onto the WoW character's bones.
 pub const OFF_POSE: usize = 0xD4000;
+/// The Skate camera, in WoW coordinates, for the host to drive the client's camera with.
+pub const OFF_CAM: usize = 0xD8000;
 pub const POSE_PARTS: usize = 32;
 pub const POSE_BOARD: usize = 8;
 
@@ -164,7 +166,24 @@ impl Default for PoseFrame {
     }
 }
 
-const _: () = assert!(OFF_POSE + core::mem::size_of::<PoseFrame>() <= MAPPING_BYTES);
+/// The guest's camera in WoW axes (X north, Y west, Z up): position, forward / left / up unit vectors and the
+/// vertical field of view (radians).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CamFrame {
+    pub seq: u32,
+    pub flags: u32,
+    pub frame: u32,
+    pub pad: u32,
+    pub pos: [f64; 3],
+    pub fwd: [f32; 3],
+    pub left: [f32; 3],
+    pub up: [f32; 3],
+    pub fov_v: f32,
+}
+
+const _: () = assert!(OFF_POSE + core::mem::size_of::<PoseFrame>() <= OFF_CAM);
+const _: () = assert!(OFF_CAM + core::mem::size_of::<CamFrame>() <= MAPPING_BYTES);
 const _: () = assert!(OFF_PATCH + 32 + PATCH_MAX_TRIS * 36 <= OFF_POSE);
 const _: () = assert!(OFF_PATCH + 32 + PATCH_MAX_TRIS * 36 <= MAPPING_BYTES);
 const _: () = assert!(core::mem::size_of::<Header>() <= 0x100);
@@ -336,6 +355,13 @@ impl Shared {
                 }
             }
         }
+    }
+
+    pub fn write_cam(&self, v: CamFrame) {
+        unsafe { self.write_slot(OFF_CAM, v) }
+    }
+    pub fn read_cam(&self) -> CamFrame {
+        unsafe { self.read_slot(OFF_CAM) }
     }
 
     pub fn write_pose(&self, v: PoseFrame) {

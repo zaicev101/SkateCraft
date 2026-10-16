@@ -131,6 +131,16 @@ fn rd<T: Copy + Default>(a: usize) -> Option<T> {
     crate::wow::read::<T>(a)
 }
 
+/// Address of the client camera object (see `camera()`), 0 when unavailable.
+pub fn camera_ptr() -> usize {
+    (|| -> Option<usize> {
+        let mgr: u32 = rd(CAMERA_MGR)?;
+        let cam: u32 = rd(mgr as usize + CAMERA_OFF)?;
+        Some(cam as usize)
+    })()
+    .unwrap_or(0)
+}
+
 /// The client camera's forward / left / up axes (world), for the camera-bone offset.
 pub fn camera_axes() -> Option<[[f32; 3]; 3]> {
     camera().map(|c| c.1)

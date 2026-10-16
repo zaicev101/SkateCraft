@@ -142,6 +142,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut vsc_until: Option<Instant> = None;
     let mut zf_checked = 0u64;
     let mut camlog_until: Option<Instant> = None;
+    let (mut last_cam_frame, mut last_cam_ms) = (0u32, 0u64);
     let mut pin_checked = 0u64;
     let mut last_gframe = u32::MAX;
     let mut prev: Option<([f64; 3], Instant)> = None;
@@ -307,6 +308,24 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             skel::CAM_DZ.store(0, Ordering::Relaxed);
         }
         if driving {
+            // the Skate camera drives the client's camera (so the view, and the stick-relative controls, match 1:1)
+            let cf = shared.read_cam();
+            if cf.frame != last_cam_frame {
+                last_cam_frame = cf.frame;
+                last_cam_ms = now;
+            }
+            if cf.fov_v > 0.05 && now.saturating_sub(last_cam_ms) < 250 {
+                let cam = board::camera_ptr();
+                if cam != 0 {
+                    let aspect = wow::read::<f32>(cam + 0x44).filter(|a| a.is_finite() && *a > 0.5).unwrap_or(1.7778);
+                    let fov_h = 2.0 * ((cf.fov_v * 0.5).tan() * aspect).atan();
+                    wow::write::<[f32; 3]>(cam + 0x08, [cf.pos[0] as f32, cf.pos[1] as f32, cf.pos[2] as f32]);
+                    wow::write::<[f32; 3]>(cam + 0x14, cf.fwd);
+                    wow::write::<[f32; 3]>(cam + 0x20, cf.left);
+                    wow::write::<[f32; 3]>(cam + 0x2C, cf.up);
+                    wow::write::<f32>(cam + 0x40, fov_h);
+                }
+            }
             let mut ps = shared.read_pose();
             if let Some(fs) = facing_s { ps.facing = fs; } // the model is posed relative to the unit's (smoothed) facing
             if ps.nparts > 0 {
@@ -386,6 +405,18 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 board::VSC_LOG.lock().unwrap().clear();
                 board::VSC_ARM.store(1, Ordering::Relaxed);
                 vsc_until = Some(Instant::now() + std::time::Duration::from_millis(40));
+            }
+        }
+        if watch_until.is_none() && state.flags & wow_flags::IN_WORLD != 0 {
+            let flagc = format!(r"{}\skatecraft_watchcam.txt", GAME_DIR.lock().unwrap());
+            if std::path::Path::new(&flagc).exists() {
+                let _ = std::fs::remove_file(&flagc);
+                let cam = board::camera_ptr();
+                if cam != 0 {
+                    log(&format!("watch: camera {cam:#x}, watching its position {:#x}", cam + 8));
+                    watch::arm(cam + 8);
+                    watch_until = Some(Instant::now() + std::time::Duration::from_secs(3));
+                }
             }
         }
         if watch_until.is_none() && state.flags & wow_flags::IN_WORLD != 0 {
