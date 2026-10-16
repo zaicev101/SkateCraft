@@ -51,9 +51,14 @@ pub fn clock() -> f64 {
 
 pub static IMPOSED: Mutex<Option<Imposed>> = Mutex::new(None);
 pub static APPLIED: AtomicU32 = AtomicU32::new(0);
+/// debug switch (`skatecraft_off.txt` containing `cam`): do not impose the Skate camera
+pub static DISABLED: AtomicU32 = AtomicU32::new(0);
 
 /// Write the imposed camera into the camera object (same-process pointers, game or worker thread).
 pub unsafe fn apply() {
+    if DISABLED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
     let cam = crate::board::camera_ptr();
     if cam == 0 {
         return;

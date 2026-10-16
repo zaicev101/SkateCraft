@@ -26,6 +26,10 @@ pub static DRAWN: AtomicU32 = AtomicU32::new(0);
 pub static DEPTH_TEST: AtomicU32 = AtomicU32::new(1);
 /// The board is drawn unlit; this dims it so it does not glow against WoW's lighting (night scenes especially).
 pub const BOARD_LIGHT: u32 = 0xFF8A8A92;
+/// debug switch (`skatecraft_off.txt` containing `board`): do not draw the board
+pub static DISABLED: AtomicU32 = AtomicU32::new(0);
+/// EndScene calls (= frames), for the fps readout
+pub static FRAMES: AtomicU32 = AtomicU32::new(0);
 pub static ZFUNC: AtomicU32 = AtomicU32::new(4);
 pub static DEBUG_MARKER: AtomicU32 = AtomicU32::new(0);
 
@@ -284,6 +288,9 @@ unsafe fn deck_texture(dev: usize) -> usize {
 }
 
 unsafe fn draw(dev: usize) {
+    if DISABLED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
     let Ok(guard) = BOARD.try_lock() else { return };
     let Some(board) = *guard else { return };
     drop(guard);
@@ -446,6 +453,7 @@ unsafe fn draw(dev: usize) {
 }
 
 unsafe extern "system" fn end_scene(dev: usize) -> Hr {
+    FRAMES.fetch_add(1, Ordering::Relaxed);
     if VSC_ARM.load(Ordering::Relaxed) != 0 {
         if let Ok(mut l) = VSC_LOG.try_lock() {
             l.push((9999, 0, [0.0; 8]));

@@ -152,6 +152,8 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut last_cursor: Option<(i32, i32)> = None;
     let mut zoom_ref: Option<f32> = None;
     let mut pin_checked = 0u64;
+    let mut off_checked = 0u64;
+    let mut last_frames = 0u32;
     let mut last_gframe = u32::MAX;
     let mut last_gt = 0u64;
     let (mut gs0, mut gs1): (Option<(u64, [f64; 3])>, Option<(u64, [f64; 3])>) = (None, None);
@@ -291,6 +293,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             }
             log(&format!("bone hook: {} entered, {} returned, {} on the player, {} retargeted, bones {:#x}, holder {:#x}, probe this {:#x} bones {:#x}", hook::ENTRY_CALLS.load(Ordering::Relaxed), hook::HOOK_CALLS.load(Ordering::Relaxed), hook::PLAYER_HITS.load(Ordering::Relaxed), skel::APPLIED.load(Ordering::Relaxed), hook::PLAYER_BONES.load(Ordering::Relaxed), hook::PLAYER_HOLDER.load(Ordering::Relaxed), hook::PROBE_THIS.load(Ordering::Relaxed), hook::PROBE_BONES.load(Ordering::Relaxed)));
             if let Ok(d) = skel::DEBUG.try_lock() { if !d.is_empty() { log(&format!("retarget: {}", *d)); } }
+            { let f = board::FRAMES.load(Ordering::Relaxed); log(&format!("fps {}", f.wrapping_sub(last_frames))); last_frames = f; }
             log(&format!("retarget safety: {} bad matrices, last bone {}", skel::BAD_COUNT.load(Ordering::Relaxed), skel::BAD_BONE.load(Ordering::Relaxed) as i32 - 1));
             if let Ok(d) = skel::DEBUG2.try_lock() { if !d.is_empty() { log(&format!("{}", *d)); } }
             if let (Ok(p), Ok(v)) = (board::DEV_PROJ.try_lock(), board::DEV_VIEW.try_lock()) { log(&format!("device proj {:.4?} view {:.3?}", *p, *v)); }
@@ -454,6 +457,13 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                     board::DEPTH_TEST.store(if v == 0 { 0 } else { 1 }, Ordering::Relaxed);
                 }
             }
+        }
+        if now.saturating_sub(off_checked) >= 1000 {
+            off_checked = now;
+            let t = std::fs::read_to_string(format!(r"{}\skatecraft_off.txt", GAME_DIR.lock().unwrap())).unwrap_or_default();
+            camhook::DISABLED.store(t.contains("cam") as u32, Ordering::Relaxed);
+            board::DISABLED.store(t.contains("board") as u32, Ordering::Relaxed);
+            skel::DISABLED.store(t.contains("bones") as u32, Ordering::Relaxed);
         }
         if now.saturating_sub(pin_checked) >= 1000 {
             pin_checked = now;

@@ -37,6 +37,8 @@ pub static CAM_DZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 pub static LEGS: Mutex<Option<([[V3; 4]; 2], f32)>> = Mutex::new(None);
 pub static BAD_BONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static BAD_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// debug switch (`skatecraft_off.txt` containing `bones`): leave the client's own animation alone
+pub static DISABLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static APPLIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 const NBONES: usize = 228;
@@ -450,6 +452,9 @@ fn forward(model: &Model, t: &Targets, b_client: &[Mat]) -> Vec<Mat> {
 
 /// Called from the hook right after the client filled `base` (bone matrices of the local player).
 pub unsafe fn apply(base: usize) {
+    if DISABLED.load(Ordering::Relaxed) != 0 {
+        return;
+    }
     let now = windows_sys::Win32::System::SystemInformation::GetTickCount64();
     if now.saturating_sub(POSE_AT.load(Ordering::Relaxed)) > 300 {
         return; // no fresh pose: leave the client's own animation
