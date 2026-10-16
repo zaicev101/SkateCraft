@@ -11,6 +11,7 @@ use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use skatecraft_protocol::*;
+mod wow;
 use std::io::Write;
 use windows_sys::core::BOOL;
 use windows_sys::Win32::Foundation::{HINSTANCE, TRUE};
@@ -98,12 +99,21 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     log("shared region ready");
     let pid = GetCurrentProcessId();
     let mut last_guest_beat = 0u64;
+    let mut last_log = 0u64;
     loop {
         let now = GetTickCount64();
         shared.set_wow_beat(pid, now);
         let frame = FRAME.fetch_add(1, Ordering::Relaxed);
-        // E1 will fill the real player state here; E0 only proves the link.
-        shared.write_wow(WowState { frame, ..Default::default() });
+        let state = wow::read_player(frame).unwrap_or(WowState { frame, ..Default::default() });
+        shared.write_wow(state);
+        // one line per second while in the world: compared with the server's `.gps`
+        if state.flags & wow_flags::IN_WORLD != 0 && now - last_log >= 1000 {
+            last_log = now;
+            log(&format!(
+                "player map {} pos ({:.2}, {:.2}, {:.2}) facing {:.3}",
+                state.map_id, state.x, state.y, state.z, state.facing
+            ));
+        }
         let g = shared.header().guest_heartbeat_ms;
         if g != last_guest_beat && last_guest_beat == 0 {
             log(&format!("guest attached (pid {})", shared.header().guest_pid));
