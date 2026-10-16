@@ -116,6 +116,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     *patch::REQUEST.lock().unwrap() = None;
     patch::spawn_builder(data.clone());
     let mut patch_at: Option<(u32, f64, f64)> = None;
+    let (mut force, mut force_checked) = (false, 0u64);
     let mut last_gframe = u32::MAX;
     let mut prev: Option<([f64; 3], Instant)> = None;
     let mut vel = [0.0f64; 2];
@@ -141,7 +142,12 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
 
         let hdr = shared.header();
         // the addon's request (repeated every couple of seconds while skate mode is on)
-        let skate_requested = hdr.skate_on != 0 && now.saturating_sub(hdr.skate_seen_ms) < 6000;
+        // (debug: a `skatecraft_force.txt` next to Wow.exe forces it on, for tests without the UI)
+        if now.saturating_sub(force_checked) >= 1000 {
+            force_checked = now;
+            force = std::path::Path::new(&format!("{}\\skatecraft_force.txt", GAME_DIR.lock().unwrap())).exists();
+        }
+        let skate_requested = force || (hdr.skate_on != 0 && now.saturating_sub(hdr.skate_seen_ms) < 6000);
         if skate_requested {
             state.flags |= wow_flags::SKATE_ON;
         }

@@ -1,0 +1,9 @@
+{
+  "id": "skatecraft-test-roam",
+  "api": 2,
+  "name": "SkateCraft roam test",
+  "version": "0.1.0",
+  "author": "skatecraft",
+  "description": "Test only: pushes every 1.5 s and turns right for 1.2 s every 10 s, logging speed and position each second.",
+  "entry": "main.lua"
+}
