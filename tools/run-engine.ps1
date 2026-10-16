@@ -9,6 +9,13 @@ $eng = Join-Path $PSScriptRoot '..\third_party\skate-3-rust-engine' | Resolve-Pa
 $rel = Join-Path $eng 'target\release'
 $assets = Join-Path $eng "target\release-packages\$Package\skate3rust-windows-x64\data\installations\4f182f0a0aac497d80a0ddc404e06058\assets" | Resolve-Path
 Stop-Process -Name skate3rust -Force -ErrorAction SilentlyContinue
+# SkateCraft's own mods that belong to every run (the test mods are installed by hand)
+$modsDst = Join-Path $rel 'mods'
+New-Item -ItemType Directory -Force $modsDst | Out-Null
+foreach ($m in @('skatecraft-friction')) {
+    $src = Join-Path $PSScriptRoot "..\mods\$m"
+    if (Test-Path $src) { Copy-Item $src $modsDst -Recurse -Force }
+}
 $env:SKATECRAFT_BRIDGE = '1'
 if ($Drive) { $env:SKATECRAFT_DRIVE = '1' } else { Remove-Item Env:SKATECRAFT_DRIVE -ErrorAction SilentlyContinue }
 $args = @('--assets', "`"$($assets.Path)`"", '--test-world', '--mute')
