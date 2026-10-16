@@ -7,6 +7,7 @@
 #![allow(clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
 
 mod collide;
+mod board;
 mod hook;
 mod patch;
 mod skel;
@@ -73,6 +74,7 @@ pub unsafe extern "C" fn sc_start(dir: *const u16) -> i32 {
 pub unsafe extern "C" fn sc_stop() {
     STOP.store(true, Ordering::SeqCst);
     hook::remove();
+    board::remove();
     for _ in 0..300 {
         if !patch::ALIVE.load(Ordering::SeqCst) {
             break;
@@ -129,6 +131,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         log("bone hook skipped (skatecraft_nohook.txt)");
     } else {
         log(if hook::install() { "bone hook installed" } else { "bone hook NOT installed (unknown client build?)" });
+        log(if board::install() { "board drawing hooked (EndScene)" } else { "board drawing NOT hooked" });
     }
     let mut bones_checked = 0u64;
     let mut model_tried = false;
@@ -258,6 +261,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             }
             log(&format!("bone hook: {} entered, {} returned, {} on the player, {} retargeted, bones {:#x}, holder {:#x}, probe this {:#x} bones {:#x}", hook::ENTRY_CALLS.load(Ordering::Relaxed), hook::HOOK_CALLS.load(Ordering::Relaxed), hook::PLAYER_HITS.load(Ordering::Relaxed), skel::APPLIED.load(Ordering::Relaxed), hook::PLAYER_BONES.load(Ordering::Relaxed), hook::PLAYER_HOLDER.load(Ordering::Relaxed), hook::PROBE_THIS.load(Ordering::Relaxed), hook::PROBE_BONES.load(Ordering::Relaxed)));
             if let Ok(d) = skel::DEBUG.try_lock() { if !d.is_empty() { log(&format!("retarget: {}", *d)); } }
+            if let Ok(d) = skel::DEBUG2.try_lock() { if !d.is_empty() { log(&format!("{}", *d)); } }
             let mv = wow::local_player().and_then(wow::read_movement);
             if let Some(p) = wow::local_player() {
                 log(&format!("run speed {:?}", wow::get_speed(p)));
@@ -287,6 +291,19 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         if driving {
             let ps = shared.read_pose();
             if ps.nparts > 0 {
+                // the board: where the Skate side says it is, around the character that stands at `acc`
+                let bd = ps.parts[24];
+                let r = skel::quat_to_r3(bd.rot);
+                let col = |c: usize| [r[0][c], r[1][c], r[2][c]];
+                let k = skel::model_scale();
+                *board::BOARD.lock().unwrap() = Some(board::BoardPose {
+                    pos: [acc.0 + (bd.pos[0] * k) as f64, acc.1 + (bd.pos[1] * k) as f64, acc.2 + (bd.pos[2] * k) as f64],
+                    // Skate local z (deck length) = WoW-local x, Skate local x = WoW-local y, Skate local y (up) = WoW-local z
+                    axes: [col(0), col(1), col(2)],
+                    scale: k,
+                    unit: [acc.0, acc.1, acc.2],
+                    at_ms: now,
+                });
                 *skel::POSE.lock().unwrap() = Some(ps);
                 skel::POSE_AT.store(now, Ordering::Relaxed);
             }

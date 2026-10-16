@@ -30,9 +30,14 @@ pub static MODEL: Mutex<Option<Model>> = Mutex::new(None);
 pub static POSE: Mutex<Option<PoseFrame>> = Mutex::new(None);
 pub static POSE_AT: AtomicU64 = AtomicU64::new(0);
 pub static DEBUG: Mutex<String> = Mutex::new(String::new());
+pub static DEBUG2: Mutex<String> = Mutex::new(String::new());
 pub static APPLIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 const NBONES: usize = 228;
+/// attachment bones that carry weapons/shields (hands, sheaths on the back and hips): collapsed to nothing
+const WEAPON_BONES: [usize; 11] = [212, 218, 219, 193, 194, 195, 196, 197, 173, 174, 198];
+/// the camera follows these ($CHD, $CCH): held in the neutral pose so the camera does not shake with the skater's motion
+const CAMERA_BONES: [usize; 2] = [211, 200];
 // bone roles of the 228-bone human model (checked against pivots when the model is loaded)
 const PELVIS: usize = 2;
 const SPINE_LOW: usize = 3;
@@ -237,6 +242,11 @@ fn bone_rot(m: &Mat) -> R3 {
 
 /// Find the player's M2 header in this process (a 228-bone model with the expected head pivot) and
 /// read its bone table. Slow (scans memory): call from the worker thread, once.
+pub fn model_scale() -> f32 {
+    SCALE.load(Ordering::Relaxed) as f32 / 1000.0
+}
+pub static SCALE: AtomicU64 = AtomicU64::new(1000);
+
 pub unsafe fn load_model() -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let needle: [u8; 8] = [b'M', b'D', b'2', b'0', 0x08, 0x01, 0x00, 0x00];
@@ -310,6 +320,7 @@ fn targets(m: &Model, p: &PoseFrame) -> Option<Targets> {
         return None;
     }
     let k = (wow_leg / sk_leg).clamp(0.5, 2.0);
+    SCALE.store((k * 1000.0) as u64, Ordering::Relaxed);
     let qs = |slot: usize| scale(q(slot), k);
 
     let mut rot: Vec<Option<R3>> = vec![None; NBONES];
@@ -375,7 +386,7 @@ fn targets(m: &Model, p: &PoseFrame) -> Option<Targets> {
     Some(Targets { rot, joint_pelvis: qs(S_HIPS) })
 }
 
-fn quat_to_r3(q: [f32; 4]) -> R3 {
+pub fn quat_to_r3(q: [f32; 4]) -> R3 {
     let (x, y, z, w) = (q[0], q[1], q[2], q[3]);
     [
         [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
@@ -402,6 +413,10 @@ pub unsafe fn apply(base: usize) {
     let wi = inv_rigid(&w);
     // model-space transforms as the client computed them
     let b_client: Vec<Mat> = mats.iter().map(|m| mul(m, &wi)).collect();
+    if let Ok(mut d) = DEBUG2.try_lock() {
+        let j = |b: usize| point(model.pivot[b], &b_client[b]);
+        *d = format!("client joints: W_t={:?} b1={:?} b2={:?} b3={:?} thigh5={:?} foot23={:?} head44={:?} | pivots b2={:?} b44={:?} b23={:?}", [w[12], w[13], w[14]], j(1), j(PELVIS), j(SPINE_LOW), j(THIGH[0]), j(FOOT[0][0]), j(HEAD), model.pivot[PELVIS], model.pivot[HEAD], model.pivot[FOOT[0][0]]);
+    }
     let mut b_new: Vec<Mat> = b_client.clone();
     for i in 1..NBONES {
         let par = model.parent[i];
@@ -422,6 +437,14 @@ pub unsafe fn apply(base: usize) {
     }
     for i in 1..NBONES {
         mats[i] = mul(&b_new[i], &w);
+    }
+    for b in CAMERA_BONES {
+        mats[b] = w; // bind pose: the camera stays level and steady
+    }
+    for b in WEAPON_BONES {
+        let mut z = [0.0f32; 16];
+        z[15] = 1.0;
+        mats[b] = z; // zero scale: whatever hangs on this attachment is invisible
     }
     APPLIED.fetch_add(1, Ordering::Relaxed);
     let _ = bone_rot;

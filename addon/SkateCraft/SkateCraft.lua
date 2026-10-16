@@ -24,13 +24,43 @@ button:RegisterForDrag("RightButton")
 button:SetScript("OnDragStart", function(self) self:StartMoving() end)
 button:SetScript("OnDragStop", function(self) self:StopMovingOrSizing() end)
 
+-- Weapons are not part of skating: put them in the backpack while skate mode is on, and back on afterwards.
+local WEAPON_SLOTS = { 16, 17, 18 } -- main hand, off hand, ranged
+local stowed = {}
+
+local function stow()
+    for _, slot in ipairs(WEAPON_SLOTS) do
+        local link = GetInventoryItemLink("player", slot)
+        if link and not CursorHasItem() then
+            PickupInventoryItem(slot)
+            if CursorHasItem() then
+                PutItemInBackpack()
+                if CursorHasItem() then
+                    ClearCursor() -- no room in the backpack: leave it equipped
+                else
+                    stowed[slot] = link
+                end
+            end
+        end
+    end
+end
+
+local function unstow()
+    for slot, link in pairs(stowed) do
+        EquipItemByName(link, slot)
+        stowed[slot] = nil
+    end
+end
+
 local function refresh()
     button:SetText(on and "Skate: ON" or "Skate: off")
 end
 
 local function set(state)
+    local was = on
     on = state and true or false
     elapsed = 0
+    if on and not was then stow() elseif was and not on then unstow() end
     send(on)
     refresh()
     DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffSkateCraft|r: skate mode " .. (on and "ON" or "off"))
