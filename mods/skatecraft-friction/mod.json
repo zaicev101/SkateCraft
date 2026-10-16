@@ -1,0 +1,9 @@
+{
+  "id": "skatecraft-friction",
+  "api": 2,
+  "name": "SkateCraft friction",
+  "version": "0.1.0",
+  "author": "skatecraft",
+  "description": "Extra rolling friction on the ground when the player is not pushing, so the skater stops on slopes of WoW terrain instead of rolling forever.",
+  "entry": "main.lua"
+}
