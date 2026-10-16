@@ -5,3 +5,5 @@ third_party/
 /dist/
 *.out
 data/
+crates/host-core/assets/
+deck-preview.png

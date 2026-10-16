@@ -38,10 +38,14 @@ pub static LEGS: Mutex<Option<([[V3; 4]; 2], f32)>> = Mutex::new(None);
 pub static APPLIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 const NBONES: usize = 228;
+/// WoW's ankle sits ~0.11 above the sole, Skate's foot bone is at the sole: lift the ankles so the soles rest on the deck
+const ANKLE_LIFT: f32 = 0.06;
 /// attachment bones that carry weapons/shields (hands, sheaths on the back and hips): collapsed to nothing
 const WEAPON_BONES: [usize; 11] = [212, 218, 219, 193, 194, 195, 196, 197, 173, 174, 198];
 /// the camera follows these ($CHD, $CCH): held in the neutral pose so the camera does not shake with the skater's motion
-const CAMERA_BONES: [usize; 2] = [211, 200];
+const CAMERA_BONES: [usize; 11] = [211, 200, 209, 210, 147, 148, 149, 150, 217, 225, 226];
+/// extra pinned bones (debug: `skatecraft_pin.txt`, comma separated), to find which bone the camera follows
+pub static EXTRA_PIN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 // bone roles of the 228-bone human model (checked against pivots when the model is loaded)
 const PELVIS: usize = 2;
 const SPINE_LOW: usize = 3;
@@ -408,7 +412,7 @@ fn targets(m: &Model, p: &PoseFrame) -> Option<Targets> {
             r_pelvis[0][0], r_pelvis[1][1], r_pelvis[2][2]
         );
     }
-    Some(Targets { rot, joint_pelvis: qs(S_HIPS), ankle_z: [qs(S_FOOT[0])[2], qs(S_FOOT[1])[2]] })
+    Some(Targets { rot, joint_pelvis: qs(S_HIPS), ankle_z: [qs(S_FOOT[0])[2] + ANKLE_LIFT, qs(S_FOOT[1])[2] + ANKLE_LIFT] })
 }
 
 pub fn quat_to_r3(q: [f32; 4]) -> R3 {
@@ -486,7 +490,8 @@ pub unsafe fn apply(base: usize) {
         let d = [0.0, 0.0, dz];
         off = [-(d[0] * l[0] + d[1] * l[1] + d[2] * l[2]), d[0] * u[0] + d[1] * u[1] + d[2] * u[2], d[0] * f[0] + d[1] * f[1] + d[2] * f[2]];
     }
-    for b in CAMERA_BONES {
+    let extra: Vec<usize> = EXTRA_PIN.try_lock().map(|g| g.clone()).unwrap_or_default();
+    for b in CAMERA_BONES.iter().copied().chain(extra.into_iter().filter(|b| *b < NBONES)) {
         let mut m = w;
         m[12] += off[0];
         m[13] += off[1];

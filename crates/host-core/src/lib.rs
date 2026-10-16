@@ -136,10 +136,13 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut bones_checked = 0u64;
     let mut model_tried = false;
     let mut z_smooth: Option<f64> = None;
+    let mut facing_s: Option<f32> = None;
     let (mut force, mut force_checked) = (false, 0u64);
     let mut watch_until: Option<Instant> = None;
     let mut vsc_until: Option<Instant> = None;
     let mut zf_checked = 0u64;
+    let mut camlog_until: Option<Instant> = None;
+    let mut pin_checked = 0u64;
     let mut last_gframe = u32::MAX;
     let mut prev: Option<([f64; 3], Instant)> = None;
     let mut vel = [0.0f64; 2];
@@ -251,7 +254,13 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 let _ = (cur, dt, &mut was_blocked, &mut block_seq);
                 acc = (out.x as f64, out.y as f64, out.z as f64);
                 wow::set_speed(p, 0.0); // the client must not also integrate our movement
-                wow::puppet(p, out.x, out.y, out.z, g.facing);
+                // the unit's facing is low-passed: the client's camera follows it, and the board's heading is noisy
+                let fs = facing_s.get_or_insert(g.facing);
+                let mut d = g.facing - *fs;
+                while d > core::f32::consts::PI { d -= 2.0 * core::f32::consts::PI; }
+                while d < -core::f32::consts::PI { d += 2.0 * core::f32::consts::PI; }
+                *fs += d * (1.0 - (-dt / 0.25).exp());
+                wow::puppet(p, out.x, out.y, out.z, *fs);
                 last_write = Some((out.x, out.y, out.z));
             }
         }
@@ -294,10 +303,12 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         }
         if !driving {
             z_smooth = None;
+            facing_s = None;
             skel::CAM_DZ.store(0, Ordering::Relaxed);
         }
         if driving {
-            let ps = shared.read_pose();
+            let mut ps = shared.read_pose();
+            if let Some(fs) = facing_s { ps.facing = fs; } // the model is posed relative to the unit's (smoothed) facing
             if ps.nparts > 0 {
                 // camera: low-pass the vertical bounce of the unit (the camera bones are shifted by the difference)
                 let zs = z_smooth.get_or_insert(acc.2);
@@ -330,6 +341,33 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                     board::DEPTH_TEST.store(if v == 0 { 0 } else { 1 }, Ordering::Relaxed);
                 }
             }
+        }
+        if now.saturating_sub(pin_checked) >= 1000 {
+            pin_checked = now;
+            let v: Vec<usize> = std::fs::read_to_string(format!(r"{}\skatecraft_pin.txt", GAME_DIR.lock().unwrap()))
+                .map(|t| t.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+                .unwrap_or_default();
+            *skel::EXTRA_PIN.lock().unwrap() = v;
+        }
+        if camlog_until.is_some() && Instant::now() >= camlog_until.unwrap() {
+            camlog_until = None;
+            board::CAMLOG_ARM.store(0, Ordering::Relaxed);
+            let rows = board::CAMLOG.lock().unwrap().clone();
+            let mut csv = String::from("t,camx,camy,camz,unitx,unity,unitz,fwdz
+");
+            for r in &rows {
+                csv += &format!("{:.0},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}
+", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+            }
+            let _ = std::fs::write(format!(r"{}\skatecraft_cam.csv", GAME_DIR.lock().unwrap()), csv);
+            log(&format!("camera log: {} frames written", rows.len()));
+            board::CAMLOG.lock().unwrap().clear();
+        }
+        if camlog_until.is_none() && std::path::Path::new(&format!(r"{}\skatecraft_camlog.txt", GAME_DIR.lock().unwrap())).exists() {
+            let _ = std::fs::remove_file(format!(r"{}\skatecraft_camlog.txt", GAME_DIR.lock().unwrap()));
+            board::CAMLOG.lock().unwrap().clear();
+            board::CAMLOG_ARM.store(1, Ordering::Relaxed);
+            camlog_until = Some(Instant::now() + std::time::Duration::from_millis(4000));
         }
         if vsc_until.is_some() && Instant::now() >= vsc_until.unwrap() {
             vsc_until = None;

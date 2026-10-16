@@ -75,6 +75,10 @@ pub unsafe fn remove_vsc() {
     windows_sys::Win32::System::Threading::Sleep(100);
 }
 
+/// debug: per-frame camera and unit positions, dumped to a CSV by the worker
+pub static CAMLOG: Mutex<Vec<[f64; 8]>> = Mutex::new(Vec::new());
+pub static CAMLOG_ARM: AtomicU32 = AtomicU32::new(0);
+
 static ORIG: AtomicU32 = AtomicU32::new(0);
 static SLOT: AtomicU32 = AtomicU32::new(0);
 
@@ -120,6 +124,7 @@ unsafe fn set_transform(dev: usize, which: u32, m: &[f32; 16]) {
 struct Vert {
     p: [f32; 3],
     c: u32,
+    uv: [f32; 2],
 }
 
 fn rd<T: Copy + Default>(a: usize) -> Option<T> {
@@ -152,6 +157,11 @@ fn camera() -> Option<([f64; 3], [[f32; 3]; 3], f32, f32, f32, f32)> {
 }
 
 fn add_box(out: &mut Vec<Vert>, board: &BoardPose, center: [f32; 3], half: [f32; 3], color: u32, cam_pos: [f64; 3]) {
+    add_box_tiled(out, board, center, half, color, cam_pos, 0.0)
+}
+
+/// `tile` > 0: texture coordinates repeat every `tile` units on each face.
+fn add_box_tiled(out: &mut Vec<Vert>, board: &BoardPose, center: [f32; 3], half: [f32; 3], color: u32, cam_pos: [f64; 3], tile: f32) {
     // box corners in the board's frame (x forward, y left, z up), scaled
     let s = board.scale;
     let corner = |sx: f32, sy: f32, sz: f32| -> [f32; 3] {
@@ -188,8 +198,10 @@ fn add_box(out: &mut Vec<Vert>, board: &BoardPose, center: [f32; 3], half: [f32;
         };
         let (p00, p10, p11, p01) = (q(-1.0, -1.0), q(1.0, -1.0), q(1.0, 1.0), q(-1.0, 1.0));
         let col = shade(color, f);
-        for p in [p00, p10, p11, p00, p11, p01] {
-            out.push(Vert { p, c: col });
+        let (ra, rb) = if tile > 0.0 { (2.0 * half[a] / tile, 2.0 * half[b] / tile) } else { (0.0, 0.0) };
+        let uv = |u: f32, v: f32| [(u * 0.5 + 0.5) * ra, (v * 0.5 + 0.5) * rb];
+        for (p, t) in [(p00, uv(-1.0, -1.0)), (p10, uv(1.0, -1.0)), (p11, uv(1.0, 1.0)), (p00, uv(-1.0, -1.0)), (p11, uv(1.0, 1.0)), (p01, uv(-1.0, 1.0))] {
+            out.push(Vert { p, c: col, uv: t });
         }
     }
 }
@@ -215,6 +227,50 @@ fn add_segment(out: &mut Vec<Vert>, a: [f64; 3], b: [f64; 3], half: f32, cam_pos
     add_box(out, &frame, [0.0, 0.0, 0.0], [len * 0.5 + half * 0.6, half, half], 0xFFFFFFFF, cam_pos);
 }
 
+static TEXTURE: AtomicU32 = AtomicU32::new(0);
+static DECK_RGBA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deck.rgba"));
+
+/// The deck texture as a managed D3D9 texture, created once (0 when it could not be made).
+unsafe fn deck_texture(dev: usize) -> usize {
+    let t = TEXTURE.load(Ordering::Relaxed);
+    if t != 0 {
+        return if t == u32::MAX { 0 } else { t as usize };
+    }
+    TEXTURE.store(u32::MAX, Ordering::Relaxed); // never retry a failure every frame
+    let (w, h) = (u32::from_le_bytes(DECK_RGBA[0..4].try_into().unwrap()), u32::from_le_bytes(DECK_RGBA[4..8].try_into().unwrap()));
+    let create: unsafe extern "system" fn(usize, u32, u32, u32, u32, u32, u32, *mut usize, *mut c_void) -> Hr = core::mem::transmute(vtbl(dev, 23));
+    let mut tex: usize = 0;
+    // 1 level, usage 0, A8R8G8B8, MANAGED pool
+    if create(dev, w, h, 1, 0, 21, 1, &mut tex, core::ptr::null_mut()) < 0 || tex == 0 {
+        return 0;
+    }
+    #[repr(C)]
+    struct Locked {
+        pitch: i32,
+        bits: *mut u8,
+    }
+    let lock: unsafe extern "system" fn(usize, u32, *mut Locked, *const c_void, u32) -> Hr = core::mem::transmute(vtbl(tex, 19));
+    let unlock: unsafe extern "system" fn(usize, u32) -> Hr = core::mem::transmute(vtbl(tex, 20));
+    let mut lr = Locked { pitch: 0, bits: core::ptr::null_mut() };
+    if lock(tex, 0, &mut lr, core::ptr::null(), 0) < 0 || lr.bits.is_null() {
+        return 0;
+    }
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let s = 8 + (y * w as usize + x) * 4;
+            let (r, g, b, a) = (DECK_RGBA[s], DECK_RGBA[s + 1], DECK_RGBA[s + 2], DECK_RGBA[s + 3]);
+            let px = lr.bits.add(y * lr.pitch as usize + x * 4);
+            *px = b;
+            *px.add(1) = g;
+            *px.add(2) = r;
+            *px.add(3) = a;
+        }
+    }
+    unlock(tex, 0);
+    TEXTURE.store(tex as u32, Ordering::Relaxed);
+    tex
+}
+
 unsafe fn draw(dev: usize) {
     let Ok(guard) = BOARD.try_lock() else { return };
     let Some(board) = *guard else { return };
@@ -224,11 +280,19 @@ unsafe fn draw(dev: usize) {
         return;
     }
     let Some((cpos, axes, near, far, fov, aspect)) = camera() else { return };
+    if CAMLOG_ARM.load(Ordering::Relaxed) != 0 {
+        if let Ok(mut l) = CAMLOG.try_lock() {
+            if l.len() < 600 {
+                l.push([now as f64, cpos[0], cpos[1], cpos[2], board.unit[0], board.unit[1], board.unit[2], axes[0][2] as f64]);
+            }
+        }
+    }
 
     // geometry: deck, grip stripe, two trucks, four wheels (board frame, metres; board bone is at the deck)
     let mut v: Vec<Vert> = Vec::with_capacity(36 * 10);
-    add_box(&mut v, &board, [0.0, 0.0, 0.0], [0.40, 0.10, 0.008], 0xFFE07020, cpos);
-    add_box(&mut v, &board, [0.0, 0.0, 0.009], [0.38, 0.09, 0.002], 0xFF303030, cpos);
+    let mut deck: Vec<Vert> = Vec::with_capacity(36);
+    add_box_tiled(&mut deck, &board, [0.0, 0.0, 0.0], [0.40, 0.10, 0.008], 0xFFFFFFFF, cpos, 0.30);
+    add_box(&mut v, &board, [0.0, 0.0, 0.0095], [0.36, 0.085, 0.002], 0xFF2A2A2A, cpos);
     for sx in [-1.0f32, 1.0] {
         add_box(&mut v, &board, [sx * 0.26, 0.0, -0.025], [0.03, 0.07, 0.015], 0xFFB0B0B0, cpos);
         for sy in [-1.0f32, 1.0] {
@@ -284,9 +348,9 @@ unsafe fn draw(dev: usize) {
             let _ = k;
             for side in legs.iter() {
                 let pts: Vec<[f64; 3]> = side.iter().map(|p| to_world(*p)).collect();
-                add_segment(&mut proxy, pts[0], pts[1], 0.10, cpos);
-                add_segment(&mut proxy, pts[1], pts[2], 0.08, cpos);
-                add_segment(&mut proxy, pts[2], pts[3], 0.07, cpos);
+                add_segment(&mut proxy, pts[0], pts[1], 0.14, cpos);
+                add_segment(&mut proxy, pts[1], pts[2], 0.11, cpos);
+                add_segment(&mut proxy, pts[2], pts[3], 0.10, cpos);
             }
         }
     }
@@ -305,7 +369,8 @@ unsafe fn draw(dev: usize) {
 
     set_vs(dev, 0);
     set_ps(dev, 0);
-    set_fvf(dev, 0x42); // XYZ | DIFFUSE
+    set_fvf(dev, 0x142); // XYZ | DIFFUSE | TEX1
+    let tex = deck_texture(dev);
     set_tex(dev, 0, 0);
     set_tss(dev, 0, 1, 2); // COLOROP = SELECTARG1
     set_tss(dev, 0, 2, 0); // COLORARG1 = DIFFUSE
@@ -338,6 +403,25 @@ unsafe fn draw(dev: usize) {
         draw_up(dev, 4, (proxy.len() / 3) as u32, proxy.as_ptr() as *const c_void, core::mem::size_of::<Vert>() as u32);
         set_rs(dev, 14, 0);
         set_rs(dev, 168, 0xF);
+    }
+    // the deck: WoW wood planks (stage 0 modulates texture and vertex colour)
+    if tex != 0 {
+        set_tex(dev, 0, tex);
+        set_tss(dev, 0, 1, 4); // COLOROP = MODULATE
+        set_tss(dev, 0, 2, 2); // COLORARG1 = TEXTURE
+        set_tss(dev, 0, 3, 0); // COLORARG2 = DIFFUSE
+        let set_ss: unsafe extern "system" fn(usize, u32, u32, u32) -> Hr = core::mem::transmute(vtbl(dev, 69));
+        set_ss(dev, 0, 1, 1); // ADDRESSU = WRAP
+        set_ss(dev, 0, 2, 1); // ADDRESSV = WRAP
+        set_ss(dev, 0, 5, 2); // MAGFILTER = LINEAR
+        set_ss(dev, 0, 6, 2); // MINFILTER = LINEAR
+        set_ss(dev, 0, 7, 0); // MIPFILTER = NONE
+        draw_up(dev, 4, (deck.len() / 3) as u32, deck.as_ptr() as *const c_void, core::mem::size_of::<Vert>() as u32);
+        set_tex(dev, 0, 0);
+        set_tss(dev, 0, 1, 2); // COLOROP = SELECTARG1
+        set_tss(dev, 0, 2, 0); // COLORARG1 = DIFFUSE
+    } else {
+        v.extend(deck.iter().map(|d| Vert { c: 0xFFE07020, ..*d }));
     }
     draw_up(dev, 4, (v.len() / 3) as u32, v.as_ptr() as *const c_void, core::mem::size_of::<Vert>() as u32);
 
