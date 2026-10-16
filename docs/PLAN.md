@@ -32,7 +32,7 @@ recompilation `mchughalex/skate3recomp` (no extension API, license not stated).
 - [ ] E1b: collision for the guest. Decision: take it from the server data (maps/ heightmaps first, then vmaps for
       buildings), loaded by the guest bridge, instead of reverse engineering the client's own trace
       functions. The host only needs to publish position and map id. Data copied to `data/maps` (not committed).
-- [ ] E2: engine builds and runs with the user's Skate 3 files; a bridge crate in the engine
+- [~] E2: engine builds and runs with the user's Skate 3 files (DONE: assets converted headless with tools/run-engine-setup.ps1, 0 warnings; engine runs on University, physics ticking; TODO: DualSense check); a bridge crate in the engine
       fork reads host state, teleports the skater, publishes skater state.
 - [ ] E3: puppet movement in the client (write position), camera follow.
 - [ ] E4: overlay composite (readback first, then shared texture with depth).
