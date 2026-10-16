@@ -7,7 +7,10 @@
 #![allow(clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
 
 mod collide;
+mod hook;
 mod patch;
+mod skel;
+mod watch;
 mod terrain;
 mod vmap;
 mod wow;
@@ -69,6 +72,7 @@ pub unsafe extern "C" fn sc_start(dir: *const u16) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sc_stop() {
     STOP.store(true, Ordering::SeqCst);
+    hook::remove();
     for _ in 0..300 {
         if !patch::ALIVE.load(Ordering::SeqCst) {
             break;
@@ -116,7 +120,15 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     *patch::REQUEST.lock().unwrap() = None;
     patch::spawn_builder(data.clone());
     let mut patch_at: Option<(u32, f64, f64)> = None;
+    let nohook = std::path::Path::new(&format!("{}\\skatecraft_nohook.txt", GAME_DIR.lock().unwrap())).exists();
+    if nohook {
+        log("bone hook skipped (skatecraft_nohook.txt)");
+    } else {
+        log(if hook::install() { "bone hook installed" } else { "bone hook NOT installed (unknown client build?)" });
+    }
+    let mut bones_checked = 0u64;
     let (mut force, mut force_checked) = (false, 0u64);
+    let mut watch_until: Option<Instant> = None;
     let mut last_gframe = u32::MAX;
     let mut prev: Option<([f64; 3], Instant)> = None;
     let mut vel = [0.0f64; 2];
@@ -239,6 +251,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 log(&format!("client drift per write: avg {:.4} max {:.4} yd over {} writes", drift_sum / drift_n as f64, drift_max, drift_n));
                 drift_sum = 0.0; drift_max = 0.0; drift_n = 0;
             }
+            log(&format!("bone hook: {} entered, {} returned, {} on the player, bones {:#x}", hook::ENTRY_CALLS.load(Ordering::Relaxed), hook::HOOK_CALLS.load(Ordering::Relaxed), hook::PLAYER_HITS.load(Ordering::Relaxed), hook::PLAYER_BONES.load(Ordering::Relaxed)));
             let mv = wow::local_player().and_then(wow::read_movement);
             if let Some(p) = wow::local_player() {
                 log(&format!("run speed {:?}", wow::get_speed(p)));
@@ -251,6 +264,37 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 vmap::floor(&data, state.map_id, state.x as f32, state.y as f32, state.z as f32, 1.5, 30.0),
                 vmap::tile_triangles(&data, state.map_id, state.x as f32, state.y as f32), mv
             ));
+        }
+        if now.saturating_sub(bones_checked) >= 20 {
+            bones_checked = now;
+            let b = wow::local_player().and_then(wow::bone_array).unwrap_or(0) as u32;
+            hook::PLAYER_BONES.store(b, Ordering::Relaxed);
+        }
+        // debug: `skatecraft_watch.txt` arms a hardware write watchpoint on a bone matrix of the player's
+        // model and logs, 3 s later, which client code wrote it
+        if watch_until.is_none() && state.flags & wow_flags::IN_WORLD != 0 {
+            let game = GAME_DIR.lock().unwrap().clone();
+            let flag = format!("{game}\\skatecraft_watch.txt");
+            if std::path::Path::new(&flag).exists() {
+                let _ = std::fs::remove_file(&flag);
+                if let Some(arr) = wow::local_player().and_then(wow::bone_array) {
+                    let target = arr + 5 * 64;
+                    log(&format!("watch: bone array {arr:#x}, watching {target:#x}"));
+                    watch::arm(target);
+                    watch_until = Some(Instant::now() + std::time::Duration::from_secs(3));
+                } else {
+                    log("watch: no bone array found");
+                }
+            }
+        }
+        if let Some(t) = watch_until {
+            if Instant::now() >= t {
+                watch_until = None;
+                for (eip, n, rets) in watch::disarm().iter().take(12) {
+                    log(&format!("watch: write from {eip:#x} x{n}, callers {:x?}", rets));
+                }
+                log("watch: done");
+            }
         }
         // never leave the character frozen: when nobody drives, a zero run speed (left behind by a
         // puppet session that ended abruptly, e.g. a core reload) is put back to the normal run speed

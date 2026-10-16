@@ -27,7 +27,7 @@ pub const MAP_ID: usize = 0x00AB_63BC;
 
 pub const TYPE_PLAYER: u32 = 4;
 
-fn read<T: Copy + Default>(addr: usize) -> Option<T> {
+pub fn read<T: Copy + Default>(addr: usize) -> Option<T> {
     let mut v = T::default();
     let mut got = 0usize;
     let ok = unsafe {
@@ -193,4 +193,22 @@ pub fn set_speed(player: usize, v: f32) {
 /// Current cached unit position.
 pub fn read_pos(player: usize) -> Option<(f32, f32, f32)> {
     Some((read(player + UNIT_POS)?, read(player + UNIT_POS + 4)?, read(player + UNIT_POS + 8)?))
+}
+
+/// Offsets of the player's model instance: object -> model holder (+0xB4) -> instance (+0x38) -> bone
+/// matrix array (+0x64), 64 bytes per bone (found with tools/bonescan.py).
+pub const OBJ_MODEL: usize = 0xB4;
+pub const MODEL_INSTANCE: usize = 0x38;
+pub const INSTANCE_BONES: usize = 0x64;
+
+pub fn model_instance(player: usize) -> Option<usize> {
+    let holder: u32 = read(player + OBJ_MODEL)?;
+    let inst: u32 = read(holder as usize + MODEL_INSTANCE)?;
+    (inst != 0).then_some(inst as usize)
+}
+
+pub fn bone_array(player: usize) -> Option<usize> {
+    let inst = model_instance(player)?;
+    let arr: u32 = read(inst + INSTANCE_BONES)?;
+    (arr != 0).then_some(arr as usize)
 }
