@@ -6,6 +6,7 @@
 
 #![allow(clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
 
+mod terrain;
 mod wow;
 
 use core::ffi::c_void;
@@ -23,6 +24,16 @@ use windows_sys::Win32::System::Threading::{
 static LOG_PATH: Mutex<String> = Mutex::new(String::new());
 static STOP: AtomicBool = AtomicBool::new(false);
 static THREAD: AtomicIsize = AtomicIsize::new(0);
+static GAME_DIR: Mutex<String> = Mutex::new(String::new());
+
+/// Folder with the server's `maps\` (heightmaps). Default: the project's data folder; a different
+/// path can be put in `skatecraft_data.txt` next to Wow.exe.
+fn data_dir() -> String {
+    let game = GAME_DIR.lock().unwrap().clone();
+    std::fs::read_to_string(format!("{game}\\skatecraft_data.txt"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| String::from("C:\\WOW_335_ONPREM\\skatecraft\\data"))
+}
 
 fn log(msg: &str) {
     let path = LOG_PATH.lock().unwrap().clone();
@@ -43,6 +54,7 @@ pub unsafe extern "C" fn sc_start(dir: *const u16) -> i32 {
     }
     let dir = String::from_utf16_lossy(core::slice::from_raw_parts(dir, n));
     *LOG_PATH.lock().unwrap() = format!("{dir}\\skatecraft.log");
+    *GAME_DIR.lock().unwrap() = dir.clone();
     STOP.store(false, Ordering::SeqCst);
     let h = CreateThread(ptr::null(), 0, Some(worker), ptr::null(), 0, ptr::null_mut());
     THREAD.store(h as isize, Ordering::SeqCst);
@@ -73,6 +85,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut last_log = 0u64;
     let mut guest_seen = false;
     let mut driving = false;
+    let data = data_dir();
     while !STOP.load(Ordering::SeqCst) {
         let now = GetTickCount64();
         shared.set_wow_beat(pid, now);
@@ -99,7 +112,9 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         }
         if driving {
             if let Some(p) = wow::local_player() {
-                wow::puppet(p, g.x as f32, g.y as f32, g.z as f32, g.facing);
+                // stay on the ground: terrain height where a heightmap exists, else the guest's own height
+                let z = terrain::height(&data, state.map_id, g.x as f32, g.y as f32).unwrap_or(g.z as f32);
+                wow::puppet(p, g.x as f32, g.y as f32, z, g.facing);
             }
         }
 
@@ -108,8 +123,9 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             let mv = wow::local_player().and_then(wow::read_movement);
             if let Some(d) = wow::local_player().and_then(wow::dump_movement) { log(&format!("cmove {d}")); }
             log(&format!(
-                "player map {} pos ({:.2}, {:.2}, {:.2}) facing {:.3} | movement {:?}",
-                state.map_id, state.x, state.y, state.z, state.facing, mv
+                "player map {} pos ({:.2}, {:.2}, {:.2}) facing {:.3} ground {:?} | movement {:?}",
+                state.map_id, state.x, state.y, state.z, state.facing,
+                terrain::height(&data, state.map_id, state.x as f32, state.y as f32), mv
             ));
         }
         Sleep(10);
