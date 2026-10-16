@@ -1,0 +1,4 @@
+# The 32-bit client folder has no Visual C++ runtime next to it: link the CRT statically
+# so version.dll has no dependencies beyond system DLLs.
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,0 +1,14 @@
+[package]
+name = "skatecraft-host-wow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Built as dinput8.dll for the 32-bit WoW 3.3.5a client (i686-pc-windows-msvc).
+[lib]
+name = "dinput8"
+crate-type = ["cdylib"]
+
+[dependencies]
+windows-sys = { workspace = true }
+skatecraft-protocol = { path = "../protocol" }

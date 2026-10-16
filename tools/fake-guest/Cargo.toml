@@ -1,0 +1,9 @@
+[package]
+name = "fake-guest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+windows-sys = { workspace = true }
+skatecraft-protocol = { path = "../../crates/protocol" }
