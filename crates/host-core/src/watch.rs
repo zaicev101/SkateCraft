@@ -74,6 +74,11 @@ unsafe fn for_each_thread(f: impl Fn(*mut c_void)) {
 
 /// Watch writes to the dword at `addr` on every thread of the client.
 pub unsafe fn arm(addr: usize) {
+    arm_mode(addr, false)
+}
+
+/// `read_too`: also trap reads (to find the code that consumes a value).
+pub unsafe fn arm_mode(addr: usize, read_too: bool) {
     *HITS.lock().unwrap() = Some(HashMap::new());
     let h = AddVectoredExceptionHandler(1, Some(handler));
     *HANDLER.lock().unwrap() = h as usize;
@@ -82,7 +87,7 @@ pub unsafe fn arm(addr: usize) {
         ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
         if GetThreadContext(t, &mut ctx) != 0 {
             ctx.Dr0 = addr as u32;
-            ctx.Dr7 = 0x000D_0001; // enable DR0: write, 4 bytes
+            ctx.Dr7 = if read_too { 0x000F_0001 } else { 0x000D_0001 }; // enable DR0: write (or read/write), 4 bytes
             SetThreadContext(t, &ctx);
         }
     });

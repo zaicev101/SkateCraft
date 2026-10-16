@@ -8,6 +8,7 @@
 
 mod collide;
 mod board;
+mod camhook;
 mod hook;
 mod patch;
 mod skel;
@@ -75,6 +76,7 @@ pub unsafe extern "C" fn sc_stop() {
     STOP.store(true, Ordering::SeqCst);
     hook::remove();
     board::remove();
+    camhook::remove();
     for _ in 0..300 {
         if !patch::ALIVE.load(Ordering::SeqCst) {
             break;
@@ -131,6 +133,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         log("bone hook skipped (skatecraft_nohook.txt)");
     } else {
         log(if hook::install() { "bone hook installed" } else { "bone hook NOT installed (unknown client build?)" });
+        log(if camhook::install() { "camera hooks installed" } else { "camera hooks NOT installed" });
         log(if board::install() { "board drawing hooked (EndScene)" } else { "board drawing NOT hooked" });
     }
     let mut bones_checked = 0u64;
@@ -319,11 +322,15 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 if cam != 0 {
                     let aspect = wow::read::<f32>(cam + 0x44).filter(|a| a.is_finite() && *a > 0.5).unwrap_or(1.7778);
                     let fov_h = 2.0 * ((cf.fov_v * 0.5).tan() * aspect).atan();
-                    wow::write::<[f32; 3]>(cam + 0x08, [cf.pos[0] as f32, cf.pos[1] as f32, cf.pos[2] as f32]);
-                    wow::write::<[f32; 3]>(cam + 0x14, cf.fwd);
-                    wow::write::<[f32; 3]>(cam + 0x20, cf.left);
-                    wow::write::<[f32; 3]>(cam + 0x2C, cf.up);
-                    wow::write::<f32>(cam + 0x40, fov_h);
+                    *camhook::IMPOSED.lock().unwrap() = Some(camhook::Imposed {
+                        pos: [cf.pos[0] as f32, cf.pos[1] as f32, cf.pos[2] as f32],
+                        fwd: cf.fwd,
+                        left: cf.left,
+                        up: cf.up,
+                        fov_h,
+                        at_ms: now,
+                    });
+                    camhook::apply();
                 }
             }
             let mut ps = shared.read_pose();
@@ -410,11 +417,15 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         if watch_until.is_none() && state.flags & wow_flags::IN_WORLD != 0 {
             let flagc = format!(r"{}\skatecraft_watchcam.txt", GAME_DIR.lock().unwrap());
             if std::path::Path::new(&flagc).exists() {
+                let flagc_path = flagc.clone();
+                let off_text = std::fs::read_to_string(&flagc_path).unwrap_or_default();
                 let _ = std::fs::remove_file(&flagc);
                 let cam = board::camera_ptr();
                 if cam != 0 {
-                    log(&format!("watch: camera {cam:#x}, watching its position {:#x}", cam + 8));
-                    watch::arm(cam + 8);
+                    let rw = off_text.trim().starts_with("rw");
+                    let off = usize::from_str_radix(off_text.trim().trim_start_matches("rw").trim().trim_start_matches("0x"), 16).unwrap_or(8);
+                    log(&format!("watch: camera {cam:#x}, watching offset {off:#x}"));
+                    watch::arm_mode(cam + off, rw);
                     watch_until = Some(Instant::now() + std::time::Duration::from_secs(3));
                 }
             }
