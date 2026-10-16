@@ -20,6 +20,9 @@ pub const MAPPING_BYTES: usize = 1 << 20;
 pub const OFF_HEADER: usize = 0x000;
 pub const OFF_WOW_STATE: usize = 0x100;
 pub const OFF_GUEST_STATE: usize = 0x200;
+/// The terrain/buildings patch the host cuts out of WoW's collision data around the player.
+pub const OFF_PATCH: usize = 0x1000;
+pub const PATCH_MAX_TRIS: usize = 24000;
 
 /// Capability flags in [`WowState::flags`].
 pub mod wow_flags {
@@ -96,6 +99,20 @@ pub struct GuestState {
     pub speed: f32,
 }
 
+/// Header of the patch slot; `count` triangles of `[f32; 9]` (three WoW-space vertices) follow it.
+/// `serial` identifies the patch (changes whenever the host cuts a new one).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PatchHeader {
+    pub seq: u32,
+    pub count: u32,
+    pub map_id: u32,
+    pub serial: u32,
+    pub cx: f64,
+    pub cy: f64,
+}
+
+const _: () = assert!(OFF_PATCH + 32 + PATCH_MAX_TRIS * 36 <= MAPPING_BYTES);
 const _: () = assert!(core::mem::size_of::<Header>() <= 0x100);
 const _: () = assert!(core::mem::size_of::<WowState>() <= 0x100);
 const _: () = assert!(core::mem::size_of::<GuestState>() <= 0x100);
@@ -141,6 +158,7 @@ impl Shared {
             let h = s.header_ptr();
             if (*h).magic != MAGIC {
                 ptr::write_bytes(s.base, 0, 0x300);
+                ptr::write_bytes(s.base.add(OFF_PATCH), 0, 32);
                 (*h).magic = MAGIC;
                 (*h).version = VERSION;
             }
@@ -213,6 +231,55 @@ impl Shared {
             fence(Ordering::Acquire);
             if seq.load(Ordering::Acquire) == a {
                 return v;
+            }
+        }
+    }
+
+    /// Publish a new patch (single writer: the host).
+    pub fn write_patch(&self, map_id: u32, cx: f64, cy: f64, serial: u32, tris: &[[f32; 9]]) {
+        let n = tris.len().min(PATCH_MAX_TRIS);
+        unsafe {
+            let p = self.base.add(OFF_PATCH) as *mut PatchHeader;
+            let seq = &*(p as *const AtomicU32);
+            let s = seq.load(Ordering::Relaxed) & !1;
+            seq.store(s.wrapping_add(1), Ordering::Relaxed);
+            fence(Ordering::Release);
+            ptr::write_volatile(ptr::addr_of_mut!((*p).count), n as u32);
+            ptr::write_volatile(ptr::addr_of_mut!((*p).map_id), map_id);
+            ptr::write_volatile(ptr::addr_of_mut!((*p).serial), serial);
+            ptr::write_volatile(ptr::addr_of_mut!((*p).cx), cx);
+            ptr::write_volatile(ptr::addr_of_mut!((*p).cy), cy);
+            ptr::copy_nonoverlapping(tris.as_ptr() as *const u8, self.base.add(OFF_PATCH + 32), n * 36);
+            fence(Ordering::Release);
+            seq.store(s.wrapping_add(2), Ordering::Release);
+        }
+    }
+
+    /// Serial of the current patch (0 = none yet); cheap, for change detection.
+    pub fn patch_serial(&self) -> u32 {
+        unsafe { ptr::read_volatile(ptr::addr_of!((*(self.base.add(OFF_PATCH) as *const PatchHeader)).serial)) }
+    }
+
+    /// Copy the current patch out (retries while the host is writing).
+    pub fn read_patch(&self) -> (PatchHeader, Vec<[f32; 9]>) {
+        unsafe {
+            let p = self.base.add(OFF_PATCH) as *const PatchHeader;
+            let seq = &*(p as *const AtomicU32);
+            loop {
+                let a = seq.load(Ordering::Acquire);
+                if a & 1 == 1 {
+                    core::hint::spin_loop();
+                    continue;
+                }
+                let h = ptr::read_volatile(p);
+                let n = (h.count as usize).min(PATCH_MAX_TRIS);
+                let mut v: Vec<[f32; 9]> = Vec::with_capacity(n);
+                ptr::copy_nonoverlapping(self.base.add(OFF_PATCH + 32), v.as_mut_ptr() as *mut u8, n * 36);
+                v.set_len(n);
+                fence(Ordering::Acquire);
+                if seq.load(Ordering::Acquire) == a {
+                    return (h, v);
+                }
             }
         }
     }

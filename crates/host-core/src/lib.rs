@@ -7,6 +7,7 @@
 #![allow(clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
 
 mod collide;
+mod patch;
 mod terrain;
 mod vmap;
 mod wow;
@@ -68,6 +69,12 @@ pub unsafe extern "C" fn sc_start(dir: *const u16) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sc_stop() {
     STOP.store(true, Ordering::SeqCst);
+    for _ in 0..300 {
+        if !patch::ALIVE.load(Ordering::SeqCst) {
+            break;
+        }
+        Sleep(10);
+    }
     let h = THREAD.swap(0, Ordering::SeqCst);
     if h != 0 {
         WaitForSingleObject(h as _, 3000);
@@ -106,6 +113,9 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut driving = false;
     let data = data_dir();
     timeBeginPeriod(1);
+    *patch::REQUEST.lock().unwrap() = None;
+    patch::spawn_builder(data.clone());
+    let mut patch_at: Option<(u32, f64, f64)> = None;
     let mut last_gframe = u32::MAX;
     let mut prev: Option<([f64; 3], Instant)> = None;
     let mut vel = [0.0f64; 2];
@@ -148,6 +158,20 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
 
         // the guest drives the player: puppet it
         let g = shared.read_guest();
+        // keep a collision patch cut around whoever is moving (the player, or the skater while driving)
+        if skate_requested && state.flags & wow_flags::IN_WORLD != 0 {
+            let (px, py) = if driving && g.flags & guest_flags::DRIVING != 0 { (g.x, g.y) } else { (state.x, state.y) };
+            let stale = match patch_at {
+                Some((m, ax, ay)) => m != state.map_id || (px - ax).hypot(py - ay) > 15.0,
+                None => true,
+            };
+            if stale {
+                patch_at = Some((state.map_id, px, py));
+                *patch::REQUEST.lock().unwrap() = patch_at;
+            }
+        } else {
+            patch_at = None;
+        }
         let want = guest_alive
             && skate_requested
             && g.flags & guest_flags::DRIVING != 0
@@ -193,13 +217,9 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                     drift_max = drift_max.max(d);
                     drift_n += 1;
                 }
-                // WoW geometry decides where the character can be (walls, floors, terrain)
-                let out = collide::step(&data, state.map_id, cur, (tx, ty), dt);
-                if out.blocked && !was_blocked {
-                    block_seq = block_seq.wrapping_add(1);
-                    log(&format!("blocked #{block_seq} at ({:.2}, {:.2}, {:.2}) wanted ({tx:.2}, {ty:.2})", out.x, out.y, out.z));
-                }
-                was_blocked = out.blocked;
+                // the Skate physics already runs inside WoW's geometry (the patch): accept its position
+                let out = collide::Outcome { x: tx, y: ty, z: pp[2] as f32, blocked: false };
+                let _ = (cur, dt, &mut was_blocked, &mut block_seq);
                 acc = (out.x as f64, out.y as f64, out.z as f64);
                 wow::set_speed(p, 0.0); // the client must not also integrate our movement
                 wow::puppet(p, out.x, out.y, out.z, g.facing);

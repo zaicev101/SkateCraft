@@ -312,3 +312,34 @@ pub fn wall_hit(dir: &str, map: u32, a: V3, b: V3) -> Option<(f32, V3)> {
     })
     .flatten()
 }
+
+/// All building/object triangles whose 8-yard cells fall inside the square of half-size `r`
+/// around (cx, cy), appended to `out` as WoW-space vertex triples.
+pub fn collect(dir: &str, map: u32, cx: f32, cy: f32, r: f32, limit: usize, out: &mut Vec<[f32; 9]>) {
+    let mut done: Vec<(i32, i32)> = Vec::new();
+    for (px, py) in [(cx - r, cy - r), (cx + r, cy - r), (cx - r, cy + r), (cx + r, cy + r)] {
+        let key = ((32.0 - px / SIZE_OF_GRIDS).floor() as i32, (32.0 - py / SIZE_OF_GRIDS).floor() as i32);
+        if done.contains(&key) {
+            continue;
+        }
+        done.push(key);
+        with_tile(dir, map, px, py, |tile| {
+            let mut seen = std::collections::HashSet::new();
+            for gx in ((cx - r) / CELL).floor() as i32..=((cx + r) / CELL).floor() as i32 {
+                for gy in ((cy - r) / CELL).floor() as i32..=((cy + r) / CELL).floor() as i32 {
+                    if let Some(ids) = tile.grid.get(&(gx, gy)) {
+                        for &i in ids {
+                            if out.len() >= limit {
+                                return;
+                            }
+                            if seen.insert(i) {
+                                let t = &tile.tris[i as usize];
+                                out.push([t.a[0], t.a[1], t.a[2], t.b[0], t.b[1], t.b[2], t.c[0], t.c[1], t.c[2]]);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
