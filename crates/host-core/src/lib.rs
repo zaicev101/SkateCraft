@@ -185,6 +185,9 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 drift_sum = 0.0; drift_max = 0.0; drift_n = 0;
             }
             let mv = wow::local_player().and_then(wow::read_movement);
+            if let Some(p) = wow::local_player() {
+                log(&format!("run speed {:?}", wow::get_speed(p)));
+            }
             if let Some(d) = wow::local_player().and_then(wow::dump_movement) { log(&format!("cmove {d}")); }
             log(&format!(
                 "player map {} pos ({:.2}, {:.2}, {:.2}) facing {:.3} ground {:?} vmap floor {:?} (tile tris {:?}) | movement {:?}",
@@ -193,6 +196,17 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 vmap::floor(&data, state.map_id, state.x as f32, state.y as f32, state.z as f32, 1.5, 30.0),
                 vmap::tile_triangles(&data, state.map_id, state.x as f32, state.y as f32), mv
             ));
+        }
+        // never leave the character frozen: when nobody drives, a zero run speed (left behind by a
+        // puppet session that ended abruptly, e.g. a core reload) is put back to the normal run speed
+        if !driving && state.flags & wow_flags::IN_WORLD != 0 {
+            if let Some(p) = wow::local_player() {
+                if wow::get_speed(p) == Some(0.0) {
+                    wow::set_speed(p, if orig_speed > 0.0 { orig_speed } else { 7.0 });
+                    wow::release(p);
+                    log("restored the character's run speed");
+                }
+            }
         }
         // debug: `skatecraft_scan.txt` next to Wow.exe makes the core list where buildings are
         // around the player (vmap floor clearly above the terrain), once per file creation

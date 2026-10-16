@@ -1,5 +1,5 @@
 -- Test autopilot: scripted pushing and a slow turn instead of a gamepad.
--- Starts ON; F9 toggles it. Every override is released when the autopilot is switched off.
+-- Starts OFF; F9 toggles it. Every override is released when the autopilot is switched off.
 local on = false
 local started = false
 local held_f9 = false
@@ -16,7 +16,7 @@ return {
     local dt = (event and tonumber(event.dt)) or 0
     if not started then
       started = true
-      on = true
+      on = false  -- off by default: press F9 to start the test autopilot
     end
     local f9 = sdk.input.down("F9") == true
     if f9 and not held_f9 then
