@@ -195,20 +195,13 @@ pub fn read_pos(player: usize) -> Option<(f32, f32, f32)> {
     Some((read(player + UNIT_POS)?, read(player + UNIT_POS + 4)?, read(player + UNIT_POS + 8)?))
 }
 
-/// Offsets of the player's model instance: object -> model holder (+0xB4) -> instance (+0x38) -> bone
-/// matrix array (+0x64), 64 bytes per bone (found with tools/bonescan.py).
+/// The player's model: object -> model (+0xB4); the bone-matrix array of a model is at `model + 0x98`
+/// (64 bytes per bone; found with tools/bonescan.py and the write watchpoint).
 pub const OBJ_MODEL: usize = 0xB4;
-pub const MODEL_INSTANCE: usize = 0x38;
-pub const INSTANCE_BONES: usize = 0x64;
-
-pub fn model_instance(player: usize) -> Option<usize> {
-    let holder: u32 = read(player + OBJ_MODEL)?;
-    let inst: u32 = read(holder as usize + MODEL_INSTANCE)?;
-    (inst != 0).then_some(inst as usize)
-}
+pub const MODEL_BONES: usize = 0x98;
 
 pub fn bone_array(player: usize) -> Option<usize> {
-    let inst = model_instance(player)?;
-    let arr: u32 = read(inst + INSTANCE_BONES)?;
+    let model: u32 = read(player + OBJ_MODEL)?;
+    let arr: u32 = read(model as usize + MODEL_BONES)?;
     (arr != 0).then_some(arr as usize)
 }

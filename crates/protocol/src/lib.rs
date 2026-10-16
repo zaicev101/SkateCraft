@@ -23,6 +23,10 @@ pub const OFF_GUEST_STATE: usize = 0x200;
 /// The terrain/buildings patch the host cuts out of WoW's collision data around the player.
 pub const OFF_PATCH: usize = 0x1000;
 pub const PATCH_MAX_TRIS: usize = 24000;
+/// The skater's pose (guest -> host), for the host to retarget onto the WoW character's bones.
+pub const OFF_POSE: usize = 0xD4000;
+pub const POSE_PARTS: usize = 32;
+pub const POSE_BOARD: usize = 8;
 
 /// Capability flags in [`WowState::flags`].
 pub mod wow_flags {
@@ -112,6 +116,56 @@ pub struct PatchHeader {
     pub cy: f64,
 }
 
+/// One body of the skater: position relative to the skater's root, world-aligned WoW axes
+/// (X north, Y west, Z up), and its orientation quaternion (x, y, z, w) in the same axes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PoseBody {
+    pub pos: [f32; 3],
+    pub rot: [f32; 4],
+}
+
+pub mod pose_flags {
+    pub const ON_BOARD: u32 = 1 << 0;
+    pub const BAILING: u32 = 1 << 1;
+    pub const AIRBORNE: u32 = 1 << 2;
+}
+
+/// The skater's pose. `parts` follow the Skate physics skeleton's part order, `board` its board bodies.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct PoseFrame {
+    pub seq: u32,
+    pub flags: u32,
+    pub frame: u32,
+    pub nparts: u32,
+    pub nboard: u32,
+    pub pad: u32,
+    pub facing: f32,
+    pub speed: f32,
+    pub parts: [PoseBody; POSE_PARTS],
+    pub board: [PoseBody; POSE_BOARD],
+}
+
+impl Default for PoseFrame {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            flags: 0,
+            frame: 0,
+            nparts: 0,
+            nboard: 0,
+            pad: 0,
+            facing: 0.0,
+            speed: 0.0,
+            parts: [PoseBody::default(); POSE_PARTS],
+            board: [PoseBody::default(); POSE_BOARD],
+        }
+    }
+}
+
+const _: () = assert!(OFF_POSE + core::mem::size_of::<PoseFrame>() <= MAPPING_BYTES);
+const _: () = assert!(OFF_PATCH + 32 + PATCH_MAX_TRIS * 36 <= OFF_POSE);
 const _: () = assert!(OFF_PATCH + 32 + PATCH_MAX_TRIS * 36 <= MAPPING_BYTES);
 const _: () = assert!(core::mem::size_of::<Header>() <= 0x100);
 const _: () = assert!(core::mem::size_of::<WowState>() <= 0x100);
@@ -282,6 +336,13 @@ impl Shared {
                 }
             }
         }
+    }
+
+    pub fn write_pose(&self, v: PoseFrame) {
+        unsafe { self.write_slot(OFF_POSE, v) }
+    }
+    pub fn read_pose(&self) -> PoseFrame {
+        unsafe { self.read_slot(OFF_POSE) }
     }
 
     pub fn write_wow(&self, v: WowState) {

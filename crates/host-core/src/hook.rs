@@ -19,39 +19,86 @@ pub static PLAYER_BONES: AtomicU32 = AtomicU32::new(0);
 pub static HOOK_CALLS: AtomicU32 = AtomicU32::new(0);
 pub static PLAYER_HITS: AtomicU32 = AtomicU32::new(0);
 pub static ENTRY_CALLS: AtomicU32 = AtomicU32::new(0);
+/// debug: the model holder of the local player, and the nearest `this` the hook has seen
+pub static PLAYER_HOLDER: AtomicU32 = AtomicU32::new(0);
+pub static PROBE_THIS: AtomicU32 = AtomicU32::new(0);
+pub static PROBE_BONES: AtomicU32 = AtomicU32::new(0);
 
-static mut SHADOW_RET: [u32; 32] = [0; 32];
-static mut SHADOW_THIS: [u32; 32] = [0; 32];
-static mut DEPTH: usize = 0;
+/// The client calls the bone update from several threads, so the saved return addresses live in a
+/// per-thread slot (found by thread id, claimed on first use).
+const SLOTS: usize = 64;
+const DEPTH_MAX: usize = 16;
+struct Slot {
+    tid: AtomicU32,
+    depth: AtomicU32,
+    ret: [AtomicU32; DEPTH_MAX],
+    this: [AtomicU32; DEPTH_MAX],
+}
+#[allow(clippy::declare_interior_mutable_const)]
+const SLOT_INIT: Slot = Slot {
+    tid: AtomicU32::new(0),
+    depth: AtomicU32::new(0),
+    ret: [const { AtomicU32::new(0) }; DEPTH_MAX],
+    this: [const { AtomicU32::new(0) }; DEPTH_MAX],
+};
+static SLOT_TABLE: [Slot; SLOTS] = [SLOT_INIT; SLOTS];
+
+fn thread_id() -> u32 {
+    let tid: u32;
+    unsafe { core::arch::asm!("mov {}, fs:[0x24]", out(reg) tid, options(nostack, readonly, preserves_flags)) };
+    tid
+}
+
+fn my_slot() -> &'static Slot {
+    let tid = thread_id();
+    let mut i = (tid as usize / 4) % SLOTS;
+    loop {
+        let s = &SLOT_TABLE[i];
+        let cur = s.tid.load(Ordering::Acquire);
+        if cur == tid {
+            return s;
+        }
+        if cur == 0 && s.tid.compare_exchange(0, tid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            return s;
+        }
+        i = (i + 1) % SLOTS;
+    }
+}
 
 #[unsafe(no_mangle)]
 extern "C" fn sc_shadow_push(ret: u32, this: u32) {
     ENTRY_CALLS.fetch_add(1, Ordering::Relaxed);
-    unsafe {
-        let d = DEPTH.min(31);
-        SHADOW_RET[d] = ret;
-        SHADOW_THIS[d] = this;
-        DEPTH = d + 1;
-    }
+    let s = my_slot();
+    let d = (s.depth.load(Ordering::Relaxed) as usize).min(DEPTH_MAX - 1);
+    s.ret[d].store(ret, Ordering::Relaxed);
+    s.this[d].store(this, Ordering::Relaxed);
+    s.depth.store(d as u32 + 1, Ordering::Relaxed);
 }
 
 /// Runs after the original returned; returns the original return address.
 #[unsafe(no_mangle)]
 extern "C" fn sc_post_main() -> u32 {
+    let s = my_slot();
+    let d = (s.depth.load(Ordering::Relaxed) as usize).saturating_sub(1);
+    s.depth.store(d as u32, Ordering::Relaxed);
+    let (ret, this) = (s.ret[d].load(Ordering::Relaxed), s.this[d].load(Ordering::Relaxed));
+    HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
     unsafe {
-        let d = DEPTH.saturating_sub(1);
-        DEPTH = d;
-        let (ret, this) = (SHADOW_RET[d], SHADOW_THIS[d]);
-        HOOK_CALLS.fetch_add(1, Ordering::Relaxed);
-        if let Some(bones) = crate::wow::read::<u32>(this as usize + 0x98) {
-            let mine = PLAYER_BONES.load(Ordering::Relaxed);
-            if bones != 0 && bones == mine {
+        let holder = PLAYER_HOLDER.load(Ordering::Relaxed);
+        if holder != 0 && this.wrapping_sub(holder) < 0x200 {
+            PROBE_THIS.store(this, Ordering::Relaxed);
+            PROBE_BONES.store(crate::wow::read::<u32>(this as usize + 0x98).unwrap_or(0), Ordering::Relaxed);
+        }
+        if holder != 0 && this == holder {
+            let bones = crate::wow::read::<u32>(this as usize + crate::wow::MODEL_BONES).unwrap_or(0);
+            if bones != 0 {
+                PLAYER_BONES.store(bones, Ordering::Relaxed);
                 PLAYER_HITS.fetch_add(1, Ordering::Relaxed);
                 crate::skel::apply(bones as usize);
             }
         }
-        ret
     }
+    ret
 }
 
 #[unsafe(naked)]

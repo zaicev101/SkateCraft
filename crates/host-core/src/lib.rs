@@ -87,6 +87,10 @@ pub unsafe extern "C" fn sc_stop() {
 }
 
 /// Start the Skate engine (tools\run-engine.ps1) hidden. The project folder is the parent of the data folder.
+fn b_ready(state: &WowState) -> bool {
+    state.flags & wow_flags::IN_WORLD != 0 && hook::PLAYER_BONES.load(Ordering::Relaxed) != 0
+}
+
 fn spawn_engine(data: &str) {
     use std::os::windows::process::CommandExt;
     let root = data.rsplit_once('\\').map(|x| x.0).unwrap_or(data);
@@ -127,6 +131,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         log(if hook::install() { "bone hook installed" } else { "bone hook NOT installed (unknown client build?)" });
     }
     let mut bones_checked = 0u64;
+    let mut model_tried = false;
     let (mut force, mut force_checked) = (false, 0u64);
     let mut watch_until: Option<Instant> = None;
     let mut last_gframe = u32::MAX;
@@ -251,7 +256,8 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 log(&format!("client drift per write: avg {:.4} max {:.4} yd over {} writes", drift_sum / drift_n as f64, drift_max, drift_n));
                 drift_sum = 0.0; drift_max = 0.0; drift_n = 0;
             }
-            log(&format!("bone hook: {} entered, {} returned, {} on the player, bones {:#x}", hook::ENTRY_CALLS.load(Ordering::Relaxed), hook::HOOK_CALLS.load(Ordering::Relaxed), hook::PLAYER_HITS.load(Ordering::Relaxed), hook::PLAYER_BONES.load(Ordering::Relaxed)));
+            log(&format!("bone hook: {} entered, {} returned, {} on the player, {} retargeted, bones {:#x}, holder {:#x}, probe this {:#x} bones {:#x}", hook::ENTRY_CALLS.load(Ordering::Relaxed), hook::HOOK_CALLS.load(Ordering::Relaxed), hook::PLAYER_HITS.load(Ordering::Relaxed), skel::APPLIED.load(Ordering::Relaxed), hook::PLAYER_BONES.load(Ordering::Relaxed), hook::PLAYER_HOLDER.load(Ordering::Relaxed), hook::PROBE_THIS.load(Ordering::Relaxed), hook::PROBE_BONES.load(Ordering::Relaxed)));
+            if let Ok(d) = skel::DEBUG.try_lock() { if !d.is_empty() { log(&format!("retarget: {}", *d)); } }
             let mv = wow::local_player().and_then(wow::read_movement);
             if let Some(p) = wow::local_player() {
                 log(&format!("run speed {:?}", wow::get_speed(p)));
@@ -269,6 +275,21 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             bones_checked = now;
             let b = wow::local_player().and_then(wow::bone_array).unwrap_or(0) as u32;
             hook::PLAYER_BONES.store(b, Ordering::Relaxed);
+            let holder = wow::local_player().and_then(|p| wow::read::<u32>(p + wow::OBJ_MODEL)).unwrap_or(0);
+            hook::PLAYER_HOLDER.store(holder, Ordering::Relaxed);
+        }
+        if !nohook && !model_tried && b_ready(&state) {
+            model_tried = true;
+            let t = Instant::now();
+            let ok = skel::load_model();
+            log(&format!("player model table: {} ({} ms)", if ok { "loaded" } else { "NOT found (unknown model: no retarget)" }, t.elapsed().as_millis()));
+        }
+        if driving {
+            let ps = shared.read_pose();
+            if ps.nparts > 0 {
+                *skel::POSE.lock().unwrap() = Some(ps);
+                skel::POSE_AT.store(now, Ordering::Relaxed);
+            }
         }
         // debug: `skatecraft_watch.txt` arms a hardware write watchpoint on a bone matrix of the player's
         // model and logs, 3 s later, which client code wrote it
