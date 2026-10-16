@@ -34,6 +34,7 @@ recompilation `mchughalex/skate3recomp` (no extension API, license not stated).
       functions. The host only needs to publish position and map id. Data copied to `data/maps` (not committed).
 - [~] E2: engine builds and runs with the user's Skate 3 files (DONE: assets converted headless with tools/run-engine-setup.ps1, 0 warnings; engine runs on University, physics ticking; TODO: DualSense check); a bridge crate in the engine
       fork reads host state, teleports the skater, publishes skater state.
-- [ ] E3: puppet movement in the client (write position), camera follow.
+- [x] E3a: puppet movement in the client verified: a fake guest walking a circle moves the character (CMovement +0x10/+0x4C position, +0x20/+0x58 facing, +0x44 flags bit0 = forward so the client keeps sending heartbeats) and the server's `.gps` follows.
+- [ ] E3b: camera follow.
 - [ ] E4: overlay composite (readback first, then shared texture with depth).
 - [ ] E5: collision streaming into Rapier bodies, input routing, polish.

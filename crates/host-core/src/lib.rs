@@ -93,6 +93,9 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         if want != driving {
             driving = want;
             log(if driving { "puppet on" } else { "puppet off" });
+            if !driving {
+                if let Some(p) = wow::local_player() { wow::release(p); }
+            }
         }
         if driving {
             if let Some(p) = wow::local_player() {
@@ -103,6 +106,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         if state.flags & wow_flags::IN_WORLD != 0 && now - last_log >= 1000 {
             last_log = now;
             let mv = wow::local_player().and_then(wow::read_movement);
+            if let Some(d) = wow::local_player().and_then(wow::dump_movement) { log(&format!("cmove {d}")); }
             log(&format!(
                 "player map {} pos ({:.2}, {:.2}, {:.2}) facing {:.3} | movement {:?}",
                 state.map_id, state.x, state.y, state.z, state.facing, mv

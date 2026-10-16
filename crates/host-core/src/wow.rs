@@ -96,8 +96,13 @@ pub fn read_player(frame: u32) -> Option<WowState> {
 // Offsets are from public client research and are verified against `.gps` at run time.
 pub const UNIT_MOVEMENT: usize = 0xD8;
 pub const MOVE_POS: usize = 0x10;
-pub const MOVE_FACING: usize = 0x1C;
-pub const MOVE_FLAGS: usize = 0x40;
+pub const MOVE_FACING: usize = 0x20;
+/// A second copy of position and facing lives further in the object.
+pub const MOVE_POS2: usize = 0x4C;
+pub const MOVE_FACING2: usize = 0x58;
+/// Movement flags (bit 0 = moving forward, found by diffing the object while walking); +0x8C is the run speed.
+pub const MOVE_FLAGS: usize = 0x44;
+pub const MOVEFLAG_FORWARD: u32 = 1;
 
 pub fn write<T: Copy>(addr: usize, v: T) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
@@ -127,7 +132,7 @@ pub fn read_movement(player: usize) -> Option<(f32, f32, f32, f32, u32)> {
         read(m + MOVE_POS + 4)?,
         read(m + MOVE_POS + 8)?,
         read(m + MOVE_FACING)?,
-        read(m + MOVE_FLAGS)?,
+        0,
     ))
 }
 
@@ -142,5 +147,32 @@ pub fn puppet(player: usize, x: f32, y: f32, z: f32, facing: f32) {
         write(m + MOVE_POS + 4, y);
         write(m + MOVE_POS + 8, z);
         write(m + MOVE_FACING, facing);
+        write(m + MOVE_POS2, x);
+        write(m + MOVE_POS2 + 4, y);
+        write(m + MOVE_POS2 + 8, z);
+        write(m + MOVE_FACING2, facing);
+        if let Some(fl) = read::<u32>(m + MOVE_FLAGS) {
+            write(m + MOVE_FLAGS, fl | MOVEFLAG_FORWARD);
+        }
+    }
+}
+
+/// Raw words of the CMovement object (to discover the movement-flags field by diffing while moving).
+pub fn dump_movement(player: usize) -> Option<String> {
+    let m = movement_ptr(player)?;
+    let mut out = String::new();
+    for i in 0..48u32 {
+        let w: u32 = read(m + (i as usize) * 4)?;
+        out.push_str(&format!("{w:08X} "));
+    }
+    Some(out)
+}
+
+/// Stop pretending to walk (clear the forward flag) when the puppet is released.
+pub fn release(player: usize) {
+    if let Some(m) = movement_ptr(player) {
+        if let Some(fl) = read::<u32>(m + MOVE_FLAGS) {
+            write(m + MOVE_FLAGS, fl & !MOVEFLAG_FORWARD);
+        }
     }
 }

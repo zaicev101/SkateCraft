@@ -32,3 +32,16 @@ if ($found) {
   "facing             : $(F32 ($found + 0x7A8))"
 }
 "map id (0xAB63BC)  : $(U32 0xAB63BC)"
+
+# --- CMovement dump: find the field offsets (facing, flags) by value
+if ($found) {
+  $m = U32 ($found + 0xD8)
+  "CMovement ptr     : $(Hex $m)"
+  if ($m) {
+    for ($o = 0; $o -lt 0x80; $o += 4) {
+      $b = RdB ($m + $o) 4
+      $u = [BitConverter]::ToUInt32($b, 0); $f = [BitConverter]::ToSingle($b, 0)
+      '  +0x{0:X2}: u32 0x{1:X8}  f32 {2}' -f $o, $u, $f
+    }
+  }
+}
