@@ -221,6 +221,17 @@ impl Drop for Shared {
     }
 }
 
+/// Milliseconds on the clock both sides use for heartbeats (GetTickCount64).
+#[cfg(windows)]
+pub fn tick_ms() -> u64 {
+    unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+}
+
+#[cfg(windows)]
+pub fn process_id() -> u32 {
+    unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
