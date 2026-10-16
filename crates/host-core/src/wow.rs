@@ -90,3 +90,57 @@ pub fn read_player(frame: u32) -> Option<WowState> {
         ..Default::default()
     })
 }
+
+// ------------------------------------------------------------------ movement (CMovement)
+// The client keeps the authoritative movement state in a CMovement object hanging off the unit.
+// Offsets are from public client research and are verified against `.gps` at run time.
+pub const UNIT_MOVEMENT: usize = 0xD8;
+pub const MOVE_POS: usize = 0x10;
+pub const MOVE_FACING: usize = 0x1C;
+pub const MOVE_FLAGS: usize = 0x40;
+
+pub fn write<T: Copy>(addr: usize, v: T) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    let mut put = 0usize;
+    let ok = unsafe {
+        WriteProcessMemory(
+            GetCurrentProcess(),
+            addr as *mut _,
+            &v as *const T as *const _,
+            core::mem::size_of::<T>(),
+            &mut put,
+        )
+    };
+    ok != 0 && put == core::mem::size_of::<T>()
+}
+
+fn movement_ptr(player: usize) -> Option<usize> {
+    let m: u32 = read(player + UNIT_MOVEMENT)?;
+    (m != 0 && m & 3 == 0).then_some(m as usize)
+}
+
+/// (x, y, z, facing, flags) as the CMovement object holds them.
+pub fn read_movement(player: usize) -> Option<(f32, f32, f32, f32, u32)> {
+    let m = movement_ptr(player)?;
+    Some((
+        read(m + MOVE_POS)?,
+        read(m + MOVE_POS + 4)?,
+        read(m + MOVE_POS + 8)?,
+        read(m + MOVE_FACING)?,
+        read(m + MOVE_FLAGS)?,
+    ))
+}
+
+/// Put the player at a position/facing: both the cached unit position and the movement object.
+pub fn puppet(player: usize, x: f32, y: f32, z: f32, facing: f32) {
+    write(player + UNIT_POS, x);
+    write(player + UNIT_POS + 4, y);
+    write(player + UNIT_POS + 8, z);
+    write(player + UNIT_FACING, facing);
+    if let Some(m) = movement_ptr(player) {
+        write(m + MOVE_POS, x);
+        write(m + MOVE_POS + 4, y);
+        write(m + MOVE_POS + 8, z);
+        write(m + MOVE_FACING, facing);
+    }
+}

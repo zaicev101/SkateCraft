@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/protocol", "crates/host-wow", "tools/fake-guest"]
+members = ["crates/protocol", "crates/host-wow", "crates/host-core", "tools/fake-guest"]
 resolver = "3"
 
 [workspace.package]

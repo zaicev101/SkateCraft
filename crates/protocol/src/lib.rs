@@ -93,6 +93,7 @@ pub struct Shared {
 }
 
 unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
 
 #[cfg(windows)]
 impl Shared {

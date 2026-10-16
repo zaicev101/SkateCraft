@@ -11,10 +11,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "skatecraft-host-wow"
+name = "skatecraft-host-core"
 version = "0.1.0"
 dependencies = [
  "skatecraft-protocol",
+ "windows-sys",
+]
+
+[[package]]
+name = "skatecraft-host-wow"
+version = "0.1.0"
+dependencies = [
  "windows-sys",
 ]
 

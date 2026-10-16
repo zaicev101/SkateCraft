@@ -1,0 +1,15 @@
+[package]
+name = "skatecraft-host-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The plugin logic, hot-loaded by the dinput8.dll proxy (crates/host-wow): rebuild this DLL and the
+# running client reloads it without a restart.
+[lib]
+name = "skatecraft_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+windows-sys = { workspace = true }
+skatecraft-protocol = { path = "../protocol" }

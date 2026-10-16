@@ -1,30 +1,26 @@
-//! SkateCraft host plugin for the WoW 3.3.5a (build 12340) client.
+//! `dinput8.dll` proxy for the WoW 3.3.5a (build 12340) client, and hot loader for the plugin core.
 //!
-//! Delivered as a `dinput8.dll` proxy: Wow.exe imports DirectInput8Create from DINPUT8.dll, so a
-//! DLL of that name next to the exe is loaded at start-up. It forwards that call to
-//! the real system DLL, and starts a worker thread that talks to the Skate guest through the
-//! shared region defined in `skatecraft-protocol`.
+//! Wow.exe imports DirectInput8Create from DINPUT8.dll, so a dinput8.dll next to the exe is loaded
+//! at start-up (version.dll does not work: Windows 11 maps the system copy earlier). This DLL only
+//! forwards that one call and runs a watcher thread: it loads `skatecraft_core.dll` from the game
+//! folder (as a private copy under `sc_live\`), and when that file changes it unloads the running
+//! core and loads the new one. Rebuilding the core therefore never needs a client restart.
 
 #![allow(non_snake_case, clippy::missing_safety_doc, unsafe_op_in_unsafe_fn)]
 
 use core::ffi::c_void;
 use core::ptr;
-use core::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
-use skatecraft_protocol::*;
-mod wow;
-use std::io::Write;
+use core::sync::atomic::{AtomicIsize, Ordering};
+use windows_sys::Win32::Foundation::{FreeLibrary, HINSTANCE, TRUE};
 use windows_sys::core::BOOL;
-use windows_sys::Win32::Foundation::{HINSTANCE, TRUE};
 use windows_sys::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetProcAddress, LoadLibraryW,
 };
-use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetTickCount64};
+use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
-use windows_sys::Win32::System::Threading::{CreateThread, GetCurrentProcessId, Sleep};
+use windows_sys::Win32::System::Threading::{CreateThread, Sleep};
 
 // ---------------------------------------------------------------- real dinput8.dll
-// Wow.exe imports a single function from DINPUT8.dll, so a dinput8.dll next to the exe is
-// loaded at start-up (version.dll does not work: Windows 11 maps the system copy earlier).
 
 static REAL: AtomicIsize = AtomicIsize::new(0);
 
@@ -65,74 +61,88 @@ pub unsafe extern "system" fn DirectInput8Create(
     core::mem::transmute::<_, FnCreate>(p)(hinst, version, riid, out, outer)
 }
 
-// ---------------------------------------------------------------- plugin
+// ---------------------------------------------------------------- hot loader
 
-static LOG_PATH: AtomicIsize = AtomicIsize::new(0);
+type FnStart = unsafe extern "C" fn(*const u16) -> i32;
+type FnStop = unsafe extern "C" fn();
 
-fn log(msg: &str) {
-    let p = LOG_PATH.load(Ordering::Relaxed);
-    if p == 0 { return; }
-    let path = unsafe { &*(p as *const String) };
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let t = unsafe { GetTickCount64() };
-        let _ = writeln!(f, "[{t}] {msg}");
+fn game_dir() -> String {
+    let mut buf = [0u16; 520];
+    let n = unsafe { GetModuleFileNameW(ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let exe = String::from_utf16_lossy(&buf[..n]);
+    exe.rsplit_once('\\').map(|x| x.0.to_string()).unwrap_or_default()
+}
+
+fn mtime(path: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+}
+
+fn note(dir: &str, msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}\\skatecraft.log")) {
+        let _ = writeln!(f, "[loader] {msg}");
     }
 }
 
-fn exe_path() -> String {
-    let mut buf = [0u16; 520];
-    let n = unsafe { GetModuleFileNameW(ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
-    String::from_utf16_lossy(&buf[..n])
-}
-
-static FRAME: AtomicU32 = AtomicU32::new(0);
-
-unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
-    log(&format!("host plugin started in {}", exe_path()));
-    let shared = match Shared::create() {
-        Ok(s) => s,
-        Err(e) => {
-            log(&format!("shared region failed: error {e}"));
-            return 1;
-        }
-    };
-    log("shared region ready");
-    let pid = GetCurrentProcessId();
-    let mut last_guest_beat = 0u64;
-    let mut last_log = 0u64;
+unsafe extern "system" fn watcher(_: *mut c_void) -> u32 {
+    let dir = game_dir();
+    let src = format!("{dir}\\skatecraft_core.dll");
+    let live_dir = format!("{dir}\\sc_live");
+    let _ = std::fs::create_dir_all(&live_dir);
+    let mut loaded: isize = 0;
+    let mut stop: Option<FnStop> = None;
+    let mut seen = None;
+    let mut generation = 0u32;
+    note(&dir, "loader started");
     loop {
-        let now = GetTickCount64();
-        shared.set_wow_beat(pid, now);
-        let frame = FRAME.fetch_add(1, Ordering::Relaxed);
-        let state = wow::read_player(frame).unwrap_or(WowState { frame, ..Default::default() });
-        shared.write_wow(state);
-        // one line per second while in the world: compared with the server's `.gps`
-        if state.flags & wow_flags::IN_WORLD != 0 && now - last_log >= 1000 {
-            last_log = now;
-            log(&format!(
-                "player map {} pos ({:.2}, {:.2}, {:.2}) facing {:.3}",
-                state.map_id, state.x, state.y, state.z, state.facing
-            ));
+        let m = mtime(&src);
+        if m.is_some() && m != seen {
+            // give the build a moment to finish writing the file
+            Sleep(300);
+            seen = mtime(&src);
+            if loaded != 0 {
+                if let Some(s) = stop {
+                    s();
+                }
+                FreeLibrary(loaded as _);
+                loaded = 0;
+                note(&dir, "core unloaded");
+            }
+            generation += 1;
+            let live = format!("{live_dir}\\core_{generation}.dll");
+            if std::fs::copy(&src, &live).is_ok() {
+                let h = LoadLibraryW(wide(&live).as_ptr());
+                if h.is_null() {
+                    note(&dir, "LoadLibrary failed for the new core");
+                } else {
+                    let start = GetProcAddress(h, b"sc_start\0".as_ptr());
+                    let stopf = GetProcAddress(h, b"sc_stop\0".as_ptr());
+                    if let (Some(start), Some(stopf)) = (start, stopf) {
+                        stop = Some(core::mem::transmute::<_, FnStop>(stopf));
+                        loaded = h as isize;
+                        let ok = core::mem::transmute::<_, FnStart>(start)(wide(&dir).as_ptr());
+                        note(&dir, &format!("core generation {generation} started: {ok}"));
+                    } else {
+                        FreeLibrary(h);
+                        note(&dir, "core is missing sc_start/sc_stop");
+                    }
+                }
+            } else {
+                note(&dir, "could not copy the core");
+            }
         }
-        let g = shared.header().guest_heartbeat_ms;
-        if g != last_guest_beat && last_guest_beat == 0 {
-            log(&format!("guest attached (pid {})", shared.header().guest_pid));
-        }
-        last_guest_beat = g;
-        Sleep(10);
+        Sleep(500);
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn DllMain(_h: HINSTANCE, reason: u32, _: *mut c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
-        let exe = exe_path().to_ascii_lowercase();
+        let mut buf = [0u16; 520];
+        let n = GetModuleFileNameW(ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) as usize;
+        let exe = String::from_utf16_lossy(&buf[..n]).to_ascii_lowercase();
         if exe.ends_with("wow.exe") {
-            let dir = exe_path();
-            let dir = dir.rsplit_once('\\').map(|x| x.0.to_string()).unwrap_or_default();
-            let path = Box::new(format!("{dir}\\skatecraft.log"));
-            LOG_PATH.store(Box::into_raw(path) as isize, Ordering::Relaxed);
-            CreateThread(ptr::null(), 0, Some(worker), ptr::null(), 0, ptr::null_mut());
+            CreateThread(ptr::null(), 0, Some(watcher), ptr::null(), 0, ptr::null_mut());
         }
     }
     TRUE
