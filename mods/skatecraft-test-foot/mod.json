@@ -1,0 +1,9 @@
+{
+  "id": "skatecraft-test-foot",
+  "api": 2,
+  "name": "SkateCraft on-foot test",
+  "version": "0.1.0",
+  "author": "skatecraft",
+  "description": "Test only: steps off the board (B) at 6 s, then runs forward and turns, logging.",
+  "entry": "main.lua"
+}

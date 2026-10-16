@@ -24,6 +24,8 @@ pub static BOARD: Mutex<Option<BoardPose>> = Mutex::new(None);
 pub static DRAWN: AtomicU32 = AtomicU32::new(0);
 /// debug: 0 = depth test off (always visible), 1 = depth tested
 pub static DEPTH_TEST: AtomicU32 = AtomicU32::new(1);
+/// The board is drawn unlit; this dims it so it does not glow against WoW's lighting (night scenes especially).
+pub const BOARD_LIGHT: u32 = 0xFF8A8A92;
 pub static ZFUNC: AtomicU32 = AtomicU32::new(4);
 pub static DEBUG_MARKER: AtomicU32 = AtomicU32::new(0);
 
@@ -301,12 +303,12 @@ unsafe fn draw(dev: usize) {
     // geometry: deck, grip stripe, two trucks, four wheels (board frame, metres; board bone is at the deck)
     let mut v: Vec<Vert> = Vec::with_capacity(36 * 10);
     let mut deck: Vec<Vert> = Vec::with_capacity(36);
-    add_box_tiled(&mut deck, &board, [0.0, 0.0, 0.0], [0.40, 0.10, 0.008], 0xFFFFFFFF, cpos, 0.30);
-    add_box(&mut v, &board, [0.0, 0.0, 0.0095], [0.36, 0.085, 0.002], 0xFF2A2A2A, cpos);
+    add_box_tiled(&mut deck, &board, [0.0, 0.0, 0.0], [0.40, 0.10, 0.008], BOARD_LIGHT, cpos, 0.30);
+    add_box(&mut v, &board, [0.0, 0.0, 0.0095], [0.36, 0.085, 0.002], 0xFF161616, cpos);
     for sx in [-1.0f32, 1.0] {
-        add_box(&mut v, &board, [sx * 0.26, 0.0, -0.025], [0.03, 0.07, 0.015], 0xFFB0B0B0, cpos);
+        add_box(&mut v, &board, [sx * 0.26, 0.0, -0.025], [0.03, 0.07, 0.015], 0xFF6A6A6A, cpos);
         for sy in [-1.0f32, 1.0] {
-            add_box(&mut v, &board, [sx * 0.26, sy * 0.085, -0.04], [0.03, 0.015, 0.03], 0xFFF0F0F0, cpos);
+            add_box(&mut v, &board, [sx * 0.26, sy * 0.085, -0.04], [0.03, 0.015, 0.03], 0xFFA8A8A8, cpos);
         }
     }
 

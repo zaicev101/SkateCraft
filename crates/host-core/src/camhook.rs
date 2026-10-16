@@ -14,20 +14,22 @@ use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMI
 
 /// The camera to impose, in WoW coordinates, set by the worker thread; `at_ms` = when it was last refreshed.
 #[derive(Clone, Copy, Default)]
-pub struct Imposed {
+pub struct CamSample {
+    pub t_us: u64,
     pub pos: [f32; 3],
     pub fwd: [f32; 3],
     pub left: [f32; 3],
     pub up: [f32; 3],
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct Imposed {
+    /// the last two guest samples (older, newer); the camera is shown one guest frame late, interpolated between them
+    pub s0: CamSample,
+    pub s1: CamSample,
+    pub delay_us: f64,
     pub fov_h: f32,
     pub at_ms: u64,
-    /// when the sample was taken (seconds on `clock()`), and how fast each part was changing (per second):
-    /// the camera is extrapolated to the moment of rendering, so it moves at the render rate, not the guest's
-    pub t: f64,
-    pub vel: [f32; 3],
-    pub dfwd: [f32; 3],
-    pub dleft: [f32; 3],
-    pub dup: [f32; 3],
     /// what the camera orbits when the player detaches it (the skater, WoW coordinates)
     pub target: [f32; 3],
 }
@@ -36,6 +38,10 @@ pub struct Imposed {
 pub static ORBIT_YAW: AtomicU32 = AtomicU32::new(0);
 pub static ORBIT_PITCH: AtomicU32 = AtomicU32::new(0);
 pub static ORBIT_MULT: AtomicU32 = AtomicU32::new(0x3F80_0000); // 1.0
+
+fn windows_us() -> u64 {
+    skatecraft_protocol::now_us()
+}
 
 /// Seconds since the first call (monotonic, sub-millisecond).
 pub fn clock() -> f64 {
@@ -59,16 +65,19 @@ pub unsafe fn apply() {
     if now.saturating_sub(c.at_ms) > 250 {
         return;
     }
-    let dt = ((clock() - c.t) as f32).clamp(0.0, 0.05);
-    let ex = |a: [f32; 3], v: [f32; 3]| [a[0] + v[0] * dt, a[1] + v[1] * dt, a[2] + v[2] * dt];
+    // interpolate between the two newest guest samples at (now - one guest frame)
+    let tr = windows_us() as f64 - c.delay_us;
+    let (a, b) = (c.s0, c.s1);
+    let s = if b.t_us > a.t_us { ((tr - a.t_us as f64) / (b.t_us - a.t_us) as f64).clamp(0.0, 1.25) as f32 } else { 1.0 };
+    let lerp = |x: [f32; 3], y: [f32; 3]| [x[0] + (y[0] - x[0]) * s, x[1] + (y[1] - x[1]) * s, x[2] + (y[2] - x[2]) * s];
     let norm = |v: [f32; 3]| {
         let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
         [v[0] / l, v[1] / l, v[2] / l]
     };
-    let mut pos = ex(c.pos, c.vel);
-    let mut fwd = norm(ex(c.fwd, c.dfwd));
-    let mut left = norm(ex(c.left, c.dleft));
-    let mut up = norm(ex(c.up, c.dup));
+    let mut pos = lerp(a.pos, b.pos);
+    let mut fwd = norm(lerp(a.fwd, b.fwd));
+    let mut left = norm(lerp(a.left, b.left));
+    let mut up = norm(lerp(a.up, b.up));
     let (yaw, pitch, mult) = (
         f32::from_bits(ORBIT_YAW.load(Ordering::Relaxed)),
         f32::from_bits(ORBIT_PITCH.load(Ordering::Relaxed)),

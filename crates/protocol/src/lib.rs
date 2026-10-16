@@ -103,6 +103,8 @@ pub struct GuestState {
     pub z: f64,
     pub facing: f32,
     pub speed: f32,
+    /// when the sample was taken (`now_us`)
+    pub t_us: u64,
 }
 
 /// Header of the patch slot; `count` triangles of `[f32; 9]` (three WoW-space vertices) follow it.
@@ -180,6 +182,8 @@ pub struct CamFrame {
     pub left: [f32; 3],
     pub up: [f32; 3],
     pub fov_v: f32,
+    /// when the sample was taken (`now_us`)
+    pub t_us: u64,
 }
 
 const _: () = assert!(OFF_POSE + core::mem::size_of::<PoseFrame>() <= OFF_CAM);
@@ -401,6 +405,18 @@ impl Drop for Shared {
 #[cfg(windows)]
 pub fn tick_ms() -> u64 {
     unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+}
+
+/// Microseconds on the system-wide performance counter: the same clock in both processes.
+#[cfg(windows)]
+pub fn now_us() -> u64 {
+    use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+    unsafe {
+        let (mut c, mut f) = (0i64, 0i64);
+        QueryPerformanceCounter(&mut c);
+        QueryPerformanceFrequency(&mut f);
+        ((c as u128 * 1_000_000) / f.max(1) as u128) as u64
+    }
 }
 
 #[cfg(windows)]

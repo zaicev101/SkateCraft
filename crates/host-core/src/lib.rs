@@ -145,16 +145,17 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut vsc_until: Option<Instant> = None;
     let mut zf_checked = 0u64;
     let mut camlog_until: Option<Instant> = None;
-    let (mut last_cam_frame, mut last_cam_ms) = (0u32, 0u64);
-    #[allow(clippy::type_complexity)]
-    let mut cam_prev: Option<(f64, [f32; 3], [f32; 3], [f32; 3], [f32; 3])> = None;
-    let mut cam_rates = ([0f32; 3], [0f32; 3], [0f32; 3], [0f32; 3]);
-    let mut cam_sample_t = 0f64;
+    let (mut last_cam_t, mut last_cam_ms) = (0u64, 0u64);
+    let (mut cam_s0, mut cam_s1) = (camhook::CamSample::default(), camhook::CamSample::default());
+    let mut cam_delay = 16_700.0f64;
     let mut orbit_polled = 0u64;
     let mut last_cursor: Option<(i32, i32)> = None;
     let mut zoom_ref: Option<f32> = None;
     let mut pin_checked = 0u64;
     let mut last_gframe = u32::MAX;
+    let mut last_gt = 0u64;
+    let (mut gs0, mut gs1): (Option<(u64, [f64; 3])>, Option<(u64, [f64; 3])>) = (None, None);
+    let mut gdelay = 16_700.0f64;
     let mut prev: Option<([f64; 3], Instant)> = None;
     let mut vel = [0.0f64; 2];
     let mut orig_speed = 0.0f32;
@@ -235,24 +236,30 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             }
         }
         if driving {
-            // a new guest sample: remember it and estimate the velocity (low-pass filtered)
-            let tnow = Instant::now();
-            if g.frame != last_gframe {
-                last_gframe = g.frame;
-                if let Some((pp, pt)) = prev {
-                    let dt = tnow.duration_since(pt).as_secs_f64();
-                    if dt > 0.002 {
-                        let nv = [(g.x - pp[0]) / dt, (g.y - pp[1]) / dt];
-                        vel = [0.6 * vel[0] + 0.4 * nv[0], 0.6 * vel[1] + 0.4 * nv[1]];
+            // guest samples carry their own timestamps (shared QPC clock). The character is shown one guest frame
+            // late and interpolated between the last two samples: smooth at the render rate, no overshoot.
+            if g.t_us != last_gt {
+                last_gt = g.t_us;
+                gs0 = gs1;
+                gs1 = Some((g.t_us, [g.x, g.y, g.z]));
+                if let (Some(a), Some(b)) = (gs0, gs1) {
+                    let iv = b.0.saturating_sub(a.0) as f64;
+                    if iv > 2000.0 && iv < 100_000.0 {
+                        gdelay = 0.85 * gdelay + 0.15 * iv;
                     }
                 }
-                prev = Some(([g.x, g.y, g.z], tnow));
             }
-            if let (Some((pp, pt)), Some(p)) = (prev, wow::local_player()) {
-                // extrapolate from the last sample so the character glides between guest frames
-                let ahead = tnow.duration_since(pt).as_secs_f64().min(0.08);
-                let (tx, ty) = ((pp[0] + vel[0] * ahead) as f32, (pp[1] + vel[1] * ahead) as f32);
-                let cur = last_write.or_else(|| wow::read_pos(p)).unwrap_or((tx, ty, pp[2] as f32));
+            if let (Some(b), Some(p)) = (gs1, wow::local_player()) {
+                let tr = skatecraft_protocol::now_us() as f64 - gdelay;
+                let pos = match gs0 {
+                    Some(a) if b.0 > a.0 => {
+                        let s = ((tr - a.0 as f64) / (b.0 - a.0) as f64).clamp(0.0, 1.25);
+                        [a.1[0] + (b.1[0] - a.1[0]) * s, a.1[1] + (b.1[1] - a.1[1]) * s, a.1[2] + (b.1[2] - a.1[2]) * s]
+                    }
+                    _ => b.1,
+                };
+                let (tx, ty) = (pos[0] as f32, pos[1] as f32);
+                let cur = last_write.or_else(|| wow::read_pos(p)).unwrap_or((tx, ty, pos[2] as f32));
                 // how far did the client move the character on its own since our last write?
                 if let (Some((cx, cy, _)), Some(lw)) = (wow::read_pos(p), last_write) {
                     let d = ((cx - lw.0).powi(2) + (cy - lw.1).powi(2)).sqrt();
@@ -261,7 +268,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                     drift_n += 1;
                 }
                 // the Skate physics already runs inside WoW's geometry (the patch): accept its position
-                let out = collide::Outcome { x: tx, y: ty, z: pp[2] as f32, blocked: false };
+                let out = collide::Outcome { x: tx, y: ty, z: pos[2] as f32, blocked: false };
                 let _ = (cur, dt, &mut was_blocked, &mut block_seq);
                 acc = (out.x as f64, out.y as f64, out.z as f64);
                 wow::set_speed(p, 0.0); // the client must not also integrate our movement
@@ -284,6 +291,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             }
             log(&format!("bone hook: {} entered, {} returned, {} on the player, {} retargeted, bones {:#x}, holder {:#x}, probe this {:#x} bones {:#x}", hook::ENTRY_CALLS.load(Ordering::Relaxed), hook::HOOK_CALLS.load(Ordering::Relaxed), hook::PLAYER_HITS.load(Ordering::Relaxed), skel::APPLIED.load(Ordering::Relaxed), hook::PLAYER_BONES.load(Ordering::Relaxed), hook::PLAYER_HOLDER.load(Ordering::Relaxed), hook::PROBE_THIS.load(Ordering::Relaxed), hook::PROBE_BONES.load(Ordering::Relaxed)));
             if let Ok(d) = skel::DEBUG.try_lock() { if !d.is_empty() { log(&format!("retarget: {}", *d)); } }
+            log(&format!("retarget safety: {} bad matrices, last bone {}", skel::BAD_COUNT.load(Ordering::Relaxed), skel::BAD_BONE.load(Ordering::Relaxed) as i32 - 1));
             if let Ok(d) = skel::DEBUG2.try_lock() { if !d.is_empty() { log(&format!("{}", *d)); } }
             if let (Ok(p), Ok(v)) = (board::DEV_PROJ.try_lock(), board::DEV_VIEW.try_lock()) { log(&format!("device proj {:.4?} view {:.3?}", *p, *v)); }
             let mv = wow::local_player().and_then(wow::read_movement);
@@ -313,6 +321,12 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             log(&format!("player model table: {} ({} ms)", if ok { "loaded" } else { "NOT found (unknown model: no retarget)" }, t.elapsed().as_millis()));
         }
         if !driving {
+            gs0 = None;
+            gs1 = None;
+            cam_s0 = camhook::CamSample::default();
+            cam_s1 = camhook::CamSample::default();
+            last_cam_t = 0;
+            last_gt = 0;
             z_smooth = None;
             facing_s = None;
             skel::CAM_DZ.store(0, Ordering::Relaxed);
@@ -368,25 +382,26 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         if driving {
             // the Skate camera drives the client's camera (so the view, and the stick-relative controls, match 1:1)
             let cf = shared.read_cam();
-            if cf.frame != last_cam_frame {
-                last_cam_frame = cf.frame;
+            if cf.t_us != 0 && cf.t_us != last_cam_t {
+                last_cam_t = cf.t_us;
                 last_cam_ms = now;
-                let tc = camhook::clock();
                 if cf.fov_v > 0.05 {
-                    let cur = ([cf.pos[0] as f32, cf.pos[1] as f32, cf.pos[2] as f32], cf.fwd, cf.left, cf.up);
-                    if let Some((pt, pp, pf, pl, pu)) = cam_prev {
-                        let dtc = (tc - pt) as f32;
-                        if dtc > 0.002 && dtc < 0.2 {
-                            let rate = |a: [f32; 3], b: [f32; 3]| [(a[0] - b[0]) / dtc, (a[1] - b[1]) / dtc, (a[2] - b[2]) / dtc];
-                            let lp = |old: [f32; 3], new: [f32; 3]| [0.5 * old[0] + 0.5 * new[0], 0.5 * old[1] + 0.5 * new[1], 0.5 * old[2] + 0.5 * new[2]];
-                            cam_rates.0 = lp(cam_rates.0, rate(cur.0, pp));
-                            cam_rates.1 = lp(cam_rates.1, rate(cur.1, pf));
-                            cam_rates.2 = lp(cam_rates.2, rate(cur.2, pl));
-                            cam_rates.3 = lp(cam_rates.3, rate(cur.3, pu));
+                    cam_s0 = cam_s1;
+                    cam_s1 = camhook::CamSample {
+                        t_us: cf.t_us,
+                        pos: [cf.pos[0] as f32, cf.pos[1] as f32, cf.pos[2] as f32],
+                        fwd: cf.fwd,
+                        left: cf.left,
+                        up: cf.up,
+                    };
+                    if cam_s0.t_us != 0 {
+                        let iv = cam_s1.t_us.saturating_sub(cam_s0.t_us) as f64;
+                        if iv > 2000.0 && iv < 100_000.0 {
+                            cam_delay = 0.85 * cam_delay + 0.15 * iv;
                         }
+                    } else {
+                        cam_s0 = cam_s1;
                     }
-                    cam_prev = Some((tc, cur.0, cur.1, cur.2, cur.3));
-                    cam_sample_t = tc;
                 }
             }
             if cf.fov_v > 0.05 && now.saturating_sub(last_cam_ms) < 250 {
@@ -395,17 +410,11 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                     let aspect = wow::read::<f32>(cam + 0x44).filter(|a| a.is_finite() && *a > 0.5).unwrap_or(1.7778);
                     let fov_h = 2.0 * ((cf.fov_v * 0.5).tan() * aspect).atan();
                     *camhook::IMPOSED.lock().unwrap() = Some(camhook::Imposed {
-                        pos: [cf.pos[0] as f32, cf.pos[1] as f32, cf.pos[2] as f32],
-                        fwd: cf.fwd,
-                        left: cf.left,
-                        up: cf.up,
+                        s0: cam_s0,
+                        s1: cam_s1,
+                        delay_us: cam_delay,
                         fov_h,
                         at_ms: now,
-                        t: cam_sample_t,
-                        vel: cam_rates.0,
-                        dfwd: cam_rates.1,
-                        dleft: cam_rates.2,
-                        dup: cam_rates.3,
                         target: [acc.0 as f32, acc.1 as f32, acc.2 as f32 + 1.0],
                     });
                     camhook::apply();

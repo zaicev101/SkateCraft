@@ -16,6 +16,9 @@ foreach ($m in @('skatecraft-friction')) {
     $src = Join-Path $PSScriptRoot "..\mods\$m"
     if (Test-Path $src) { Copy-Item $src $modsDst -Recurse -Force }
 }
+# a rebuilt engine wants its own hashed bevy_dylib next to the exe
+$newest = Get-ChildItem (Join-Path $rel 'deps\bevy_dylib-*.dll') | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($newest) { Copy-Item $newest.FullName (Join-Path $rel $newest.Name) -Force }
 $env:SKATECRAFT_BRIDGE = '1'
 if ($Drive) { $env:SKATECRAFT_DRIVE = '1' } else { Remove-Item Env:SKATECRAFT_DRIVE -ErrorAction SilentlyContinue }
 $args = @('--assets', "`"$($assets.Path)`"", '--test-world', '--mute')

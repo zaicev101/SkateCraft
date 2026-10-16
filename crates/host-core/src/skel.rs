@@ -35,6 +35,8 @@ pub static DEBUG2: Mutex<String> = Mutex::new(String::new());
 pub static CAM_DZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// Leg joints of the retargeted model (model space: hip, knee, ankle, toe) per side, and the facing: for depth proxies.
 pub static LEGS: Mutex<Option<([[V3; 4]; 2], f32)>> = Mutex::new(None);
+pub static BAD_BONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static BAD_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static APPLIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 const NBONES: usize = 228;
@@ -470,6 +472,9 @@ pub unsafe fn apply(base: usize) {
     let side = if t.ankle_z[0] <= t.ankle_z[1] { 0 } else { 1 };
     let ankle_now = point(model.pivot[FOOT[side][0]], &b_new[FOOT[side][0]])[2];
     let err = (t.ankle_z[side] - ankle_now).clamp(-0.6, 0.6);
+    if let Ok(mut d) = DEBUG2.try_lock() {
+        *d = format!("ankle match: side {side} target {:.3} now {:.3} err {:.3} pelvis_z {:.3}", t.ankle_z[side], ankle_now, err, t.joint_pelvis[2]);
+    }
     if err.is_finite() && err.abs() > 0.003 {
         t.joint_pelvis[2] += err;
         b_new = forward(model, &t, &b_client);
@@ -479,8 +484,17 @@ pub unsafe fn apply(base: usize) {
         let side = |s: usize| [j(THIGH[s]), j(SHIN[s][1]), j(FOOT[s][0]), j(TOE[s])];
         *l = Some(([side(0), side(1)], pose.facing));
     }
+    let original: Vec<Mat> = mats.to_vec();
     for i in 1..NBONES {
-        mats[i] = mul(&b_new[i], &w);
+        let m = mul(&b_new[i], &w);
+        // never hand the GPU a degenerate matrix (it stretches the skinned mesh across the screen): keep the client's own
+        if m.iter().all(|v| v.is_finite() && v.abs() < 5000.0) && sane_scale(&m) {
+            mats[i] = m;
+        } else {
+            BAD_BONE.store(i as u32 + 1, Ordering::Relaxed);
+            BAD_COUNT.fetch_add(1, Ordering::Relaxed);
+            mats[i] = original[i];
+        }
     }
     // the camera follows these ($CHD, $CCH): neutral pose, plus the smoothed-out vertical bounce of the unit
     let dz = f32::from_bits(CAM_DZ.load(Ordering::Relaxed));
@@ -505,6 +519,12 @@ pub unsafe fn apply(base: usize) {
     }
     APPLIED.fetch_add(1, Ordering::Relaxed);
     let _ = bone_rot;
+}
+
+/// The rotation rows of a bone matrix have roughly unit length (no collapsed or exploded axes).
+fn sane_scale(m: &Mat) -> bool {
+    let n = |a: usize| (m[a] * m[a] + m[a + 1] * m[a + 1] + m[a + 2] * m[a + 2]).sqrt();
+    (0.2..4.0).contains(&n(0)) && (0.2..4.0).contains(&n(4)) && (0.2..4.0).contains(&n(8))
 }
 
 /// A finite rotation + translation matrix with w = 1 (row-vector layout).
