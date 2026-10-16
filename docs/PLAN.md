@@ -27,8 +27,9 @@ recompilation `mchughalex/skate3recomp` (no extension API, license not stated).
 ## Milestones
 
 - [x] E0: plugin loads in the client, shared region, heartbeat, fake guest sees it.
-- [ ] E1: read the player's position/facing/map from the client (3.3.5a object manager),
-      verify against `.gps`; ground height / ray queries for collision.
+- [x] E1a: player position/facing/map read from the client object manager; verified against `.gps`
+      (Ragefire Chasm, map 389, x/y/z/facing identical to 6 digits). Offsets in `wow.rs`.
+- [ ] E1b: ground height / ray queries for collision (find the client's trace function).
 - [ ] E2: engine builds and runs with the user's Skate 3 files; a bridge crate in the engine
       fork reads host state, teleports the skater, publishes skater state.
 - [ ] E3: puppet movement in the client (write position), camera follow.
