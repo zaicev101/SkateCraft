@@ -31,6 +31,10 @@ pub static POSE: Mutex<Option<PoseFrame>> = Mutex::new(None);
 pub static POSE_AT: AtomicU64 = AtomicU64::new(0);
 pub static DEBUG: Mutex<String> = Mutex::new(String::new());
 pub static DEBUG2: Mutex<String> = Mutex::new(String::new());
+/// world-space vertical offset (f32 bits) that turns the unit's raw height into its smoothed height, for the camera bones
+pub static CAM_DZ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Leg joints of the retargeted model (model space: hip, knee, ankle, toe) per side, and the facing: for depth proxies.
+pub static LEGS: Mutex<Option<([[V3; 4]; 2], f32)>> = Mutex::new(None);
 pub static APPLIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 const NBONES: usize = 228;
@@ -172,6 +176,21 @@ fn aim(a: V3, b: V3) -> R3 {
     r
 }
 
+/// Rotation of a limb bone: its direction turns from `d0` to `d1`, and its twist follows the hint
+/// vector (`h0` at rest, `h1` now) so knees and elbows keep facing the way the body faces.
+fn limb(d0: V3, d1: V3, h0: V3, h1: V3) -> R3 {
+    let axes = |d: V3, h: V3| -> R3 {
+        let a = norm(d);
+        let mut b = sub(h, scale(a, dot(a, h)));
+        if len(b) < 1e-3 {
+            b = if a[0].abs() < 0.9 { cross(a, [1.0, 0.0, 0.0]) } else { cross(a, [0.0, 1.0, 0.0]) };
+        }
+        let b = norm(b);
+        from_cols(a, b, cross(a, b))
+    };
+    mul3(&axes(d1, h1), &tr3(&axes(d0, h0)))
+}
+
 /// Frame with axes (forward, left, up) from an up hint and a left hint (model space: x forward, y left, z up).
 fn frame(up: V3, left: V3) -> R3 {
     let u = norm(up);
@@ -304,6 +323,8 @@ unsafe fn parse(h: usize) -> Option<Model> {
 struct Targets {
     rot: Vec<Option<R3>>,
     joint_pelvis: V3,
+    /// wanted ankle heights (model space), [right, left]
+    ankle_z: [f32; 2],
 }
 
 fn targets(m: &Model, p: &PoseFrame) -> Option<Targets> {
@@ -354,23 +375,27 @@ fn targets(m: &Model, p: &PoseFrame) -> Option<Targets> {
     for side in 0..2 {
         rot[SHOULDER[side]] = Some(r_chest);
         // upper arm: elbow direction; forearm: wrist direction
-        let a = aim(sub(rest(FOREARM[side][1]), rest(ARM[side])), sub(qs(S_FOREARM[side]), qs(S_ARM[side])));
+        let fwd0 = [1.0, 0.0, 0.0];
+        let (pf, cf) = (col(&pelvis_now, 0), col(&chest_now, 0));
+        // upper arm / forearm: elbow and wrist directions, twist from the chest's facing
+        let a = limb(sub(rest(FOREARM[side][1]), rest(ARM[side])), sub(qs(S_FOREARM[side]), qs(S_ARM[side])), fwd0, cf);
         rot[ARM[side]] = Some(a);
-        let f = aim(sub(rest(HAND[side][0]), rest(FOREARM[side][1])), sub(qs(S_HAND[side]), qs(S_FOREARM[side])));
+        let f = limb(sub(rest(HAND[side][0]), rest(FOREARM[side][1])), sub(qs(S_HAND[side]), qs(S_FOREARM[side])), fwd0, cf);
         for b in FOREARM[side] {
             rot[b] = Some(f);
         }
         for b in HAND[side] {
             rot[b] = Some(f);
         }
-        // legs
-        let t = aim(sub(rest(SHIN[side][1]), rest(THIGH[side])), sub(qs(S_LEG[side]), qs(S_UPLEG[side])));
+        // legs: knee and ankle directions, twist from the pelvis' facing; the foot stays level
+        let t = limb(sub(rest(SHIN[side][1]), rest(THIGH[side])), sub(qs(S_LEG[side]), qs(S_UPLEG[side])), fwd0, pf);
         rot[THIGH[side]] = Some(t);
-        let sh = aim(sub(rest(FOOT[side][0]), rest(SHIN[side][1])), sub(qs(S_FOOT[side]), qs(S_LEG[side])));
+        let sh = limb(sub(rest(FOOT[side][0]), rest(SHIN[side][1])), sub(qs(S_FOOT[side]), qs(S_LEG[side])), fwd0, pf);
         for b in SHIN[side] {
             rot[b] = Some(sh);
         }
-        let ft = aim(sub(rest(TOE[side]), rest(FOOT[side][0])), sub(qs(S_TOE[side]), qs(S_FOOT[side])));
+        let up = [0.0, 0.0, 1.0];
+        let ft = limb(sub(rest(TOE[side]), rest(FOOT[side][0])), sub(qs(S_TOE[side]), qs(S_FOOT[side])), up, up);
         for b in FOOT[side] {
             rot[b] = Some(ft);
         }
@@ -383,7 +408,7 @@ fn targets(m: &Model, p: &PoseFrame) -> Option<Targets> {
             r_pelvis[0][0], r_pelvis[1][1], r_pelvis[2][2]
         );
     }
-    Some(Targets { rot, joint_pelvis: qs(S_HIPS) })
+    Some(Targets { rot, joint_pelvis: qs(S_HIPS), ankle_z: [qs(S_FOOT[0])[2], qs(S_FOOT[1])[2]] })
 }
 
 pub fn quat_to_r3(q: [f32; 4]) -> R3 {
@@ -393,6 +418,28 @@ pub fn quat_to_r3(q: [f32; 4]) -> R3 {
         [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
         [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
     ]
+}
+
+/// Forward kinematics of the retargeted skeleton (model space).
+fn forward(model: &Model, t: &Targets, b_client: &[Mat]) -> Vec<Mat> {
+    let mut b_new: Vec<Mat> = b_client.to_vec();
+    for i in 1..NBONES {
+        let par = model.parent[i];
+        if par < 0 {
+            continue;
+        }
+        let par = if i == SPINE_LOW { PELVIS } else { par as usize }; // the torso hangs off the pelvis
+        let pm = b_new[par];
+        if let Some(r) = &t.rot[i] {
+            // joint = where this bone's pivot goes under the parent's new transform (pelvis: the pose's hips)
+            let joint = if i == PELVIS { t.joint_pelvis } else { point(model.pivot[i], &pm) };
+            b_new[i] = bone_matrix(r, model.pivot[i], joint);
+        } else {
+            let l = mul(&b_client[i], &inv_rigid(&b_client[model.parent[i] as usize]));
+            b_new[i] = mul(&l, &pm);
+        }
+    }
+    b_new
 }
 
 /// Called from the hook right after the client filled `base` (bone matrices of the local player).
@@ -413,33 +460,38 @@ pub unsafe fn apply(base: usize) {
     let wi = inv_rigid(&w);
     // model-space transforms as the client computed them
     let b_client: Vec<Mat> = mats.iter().map(|m| mul(m, &wi)).collect();
-    if let Ok(mut d) = DEBUG2.try_lock() {
-        let j = |b: usize| point(model.pivot[b], &b_client[b]);
-        *d = format!("client joints: W_t={:?} b1={:?} b2={:?} b3={:?} thigh5={:?} foot23={:?} head44={:?} | pivots b2={:?} b44={:?} b23={:?}", [w[12], w[13], w[14]], j(1), j(PELVIS), j(SPINE_LOW), j(THIGH[0]), j(FOOT[0][0]), j(HEAD), model.pivot[PELVIS], model.pivot[HEAD], model.pivot[FOOT[0][0]]);
+    let mut t = t;
+    let mut b_new = forward(model, &t, &b_client);
+    // stand on the board: the ankles must be as high as the Skate skater's (board included)
+    let side = if t.ankle_z[0] <= t.ankle_z[1] { 0 } else { 1 };
+    let ankle_now = point(model.pivot[FOOT[side][0]], &b_new[FOOT[side][0]])[2];
+    let err = (t.ankle_z[side] - ankle_now).clamp(-0.6, 0.6);
+    if err.is_finite() && err.abs() > 0.003 {
+        t.joint_pelvis[2] += err;
+        b_new = forward(model, &t, &b_client);
     }
-    let mut b_new: Vec<Mat> = b_client.clone();
-    for i in 1..NBONES {
-        let par = model.parent[i];
-        if par < 0 {
-            continue;
-        }
-        let par = if i == SPINE_LOW { PELVIS } else { par as usize }; // the torso hangs off the pelvis
-        let pm = &b_new[par];
-        if let Some(r) = &t.rot[i] {
-            // joint = where this bone's pivot goes under the parent's new transform (pelvis: the pose's hips)
-            let joint = if i == PELVIS { t.joint_pelvis } else { point(model.pivot[i], pm) };
-            // keep the client's own local twist for bones whose parent is not retargeted? (none here)
-            b_new[i] = bone_matrix(r, model.pivot[i], joint);
-        } else {
-            let l = mul(&b_client[i], &inv_rigid(&b_client[model.parent[i] as usize]));
-            b_new[i] = mul(&l, pm);
-        }
+    if let Ok(mut l) = LEGS.try_lock() {
+        let j = |b: usize| point(model.pivot[b], &b_new[b]);
+        let side = |s: usize| [j(THIGH[s]), j(SHIN[s][1]), j(FOOT[s][0]), j(TOE[s])];
+        *l = Some(([side(0), side(1)], pose.facing));
     }
     for i in 1..NBONES {
         mats[i] = mul(&b_new[i], &w);
     }
+    // the camera follows these ($CHD, $CCH): neutral pose, plus the smoothed-out vertical bounce of the unit
+    let dz = f32::from_bits(CAM_DZ.load(Ordering::Relaxed));
+    let mut off = [0.0f32; 3];
+    if let Some(axes) = crate::board::camera_axes() {
+        let (f, l, u) = (axes[0], axes[1], axes[2]);
+        let d = [0.0, 0.0, dz];
+        off = [-(d[0] * l[0] + d[1] * l[1] + d[2] * l[2]), d[0] * u[0] + d[1] * u[1] + d[2] * u[2], d[0] * f[0] + d[1] * f[1] + d[2] * f[2]];
+    }
     for b in CAMERA_BONES {
-        mats[b] = w; // bind pose: the camera stays level and steady
+        let mut m = w;
+        m[12] += off[0];
+        m[13] += off[1];
+        m[14] += off[2];
+        mats[b] = m;
     }
     for b in WEAPON_BONES {
         let mut z = [0.0f32; 16];

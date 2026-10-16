@@ -23,8 +23,57 @@ pub struct BoardPose {
 pub static BOARD: Mutex<Option<BoardPose>> = Mutex::new(None);
 pub static DRAWN: AtomicU32 = AtomicU32::new(0);
 /// debug: 0 = depth test off (always visible), 1 = depth tested
-pub static DEPTH_TEST: AtomicU32 = AtomicU32::new(0);
+pub static DEPTH_TEST: AtomicU32 = AtomicU32::new(1);
+pub static ZFUNC: AtomicU32 = AtomicU32::new(4);
 pub static DEBUG_MARKER: AtomicU32 = AtomicU32::new(0);
+
+pub static DEV_PROJ: Mutex<[f32; 16]> = Mutex::new([0.0; 16]);
+pub static DEV_VIEW: Mutex<[f32; 16]> = Mutex::new([0.0; 16]);
+/// debug: first shader-constant uploads of a frame (register, count, first 8 floats)
+pub static VSC_LOG: Mutex<Vec<(u32, u32, [f32; 8])>> = Mutex::new(Vec::new());
+pub static VSC_ARM: AtomicU32 = AtomicU32::new(0);
+static ORIG_VSC: AtomicU32 = AtomicU32::new(0);
+static SLOT_VSC: AtomicU32 = AtomicU32::new(0);
+
+/// debug: hook of Clear (slot 43) to see when the depth buffer is cleared relative to EndScene
+unsafe extern "system" fn set_vsc(dev: usize, count: u32, rects: *const c_void, flags: u32, color: u32, z: f32, stencil: u32) -> Hr {
+    if VSC_ARM.load(Ordering::Relaxed) != 0 {
+        if let Ok(mut l) = VSC_LOG.try_lock() {
+            if l.len() < 400 {
+                l.push((flags, count, [z, stencil as f32, color as f32, 0.0, 0.0, 0.0, 0.0, 0.0]));
+            }
+        }
+    }
+    let orig: unsafe extern "system" fn(usize, u32, *const c_void, u32, u32, f32, u32) -> Hr = core::mem::transmute(ORIG_VSC.load(Ordering::Relaxed) as usize);
+    orig(dev, count, rects, flags, color, z, stencil)
+}
+
+pub unsafe fn install_vsc() -> bool {
+    let Some(gx) = rd::<u32>(GLOBAL_GX) else { return false };
+    let Some(dev) = rd::<u32>(gx as usize + GX_DEVICE) else { return false };
+    let vt = *(dev as usize as *const usize);
+    let slot = vt + 43 * 4;
+    let orig = *(slot as *const usize);
+    let mut old = 0u32;
+    VirtualProtect(slot as _, 4, PAGE_EXECUTE_READWRITE, &mut old);
+    ORIG_VSC.store(orig as u32, Ordering::SeqCst);
+    *(slot as *mut usize) = set_vsc as usize;
+    VirtualProtect(slot as _, 4, old, &mut old);
+    SLOT_VSC.store(slot as u32, Ordering::SeqCst);
+    true
+}
+
+pub unsafe fn remove_vsc() {
+    let slot = SLOT_VSC.swap(0, Ordering::SeqCst) as usize;
+    if slot == 0 {
+        return;
+    }
+    let mut old = 0u32;
+    VirtualProtect(slot as _, 4, PAGE_EXECUTE_READWRITE, &mut old);
+    *(slot as *mut usize) = ORIG_VSC.load(Ordering::SeqCst) as usize;
+    VirtualProtect(slot as _, 4, old, &mut old);
+    windows_sys::Win32::System::Threading::Sleep(100);
+}
 
 static ORIG: AtomicU32 = AtomicU32::new(0);
 static SLOT: AtomicU32 = AtomicU32::new(0);
@@ -75,6 +124,11 @@ struct Vert {
 
 fn rd<T: Copy + Default>(a: usize) -> Option<T> {
     crate::wow::read::<T>(a)
+}
+
+/// The client camera's forward / left / up axes (world), for the camera-bone offset.
+pub fn camera_axes() -> Option<[[f32; 3]; 3]> {
+    camera().map(|c| c.1)
 }
 
 /// The client camera: position, forward/left/up (world axes), near, far, fov, aspect.
@@ -140,6 +194,27 @@ fn add_box(out: &mut Vec<Vert>, board: &BoardPose, center: [f32; 3], half: [f32;
     }
 }
 
+/// A box from `a` to `b` (world, camera-relative handled by the caller's `cam_pos`) with the given half width.
+fn add_segment(out: &mut Vec<Vert>, a: [f64; 3], b: [f64; 3], half: f32, cam_pos: [f64; 3]) {
+    let d = [(b[0] - a[0]) as f32, (b[1] - a[1]) as f32, (b[2] - a[2]) as f32];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    if len < 1e-4 {
+        return;
+    }
+    let x = [d[0] / len, d[1] / len, d[2] / len];
+    let hint = if x[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] };
+    let cr = |p: [f32; 3], q: [f32; 3]| [p[1] * q[2] - p[2] * q[1], p[2] * q[0] - p[0] * q[2], p[0] * q[1] - p[1] * q[0]];
+    let n = |v: [f32; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+        [v[0] / l, v[1] / l, v[2] / l]
+    };
+    let y = n(cr(hint, x));
+    let z = n(cr(x, y));
+    let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5, (a[2] + b[2]) * 0.5];
+    let frame = BoardPose { pos: mid, axes: [x, y, z], scale: 1.0, unit: mid, at_ms: 0 };
+    add_box(out, &frame, [0.0, 0.0, 0.0], [len * 0.5 + half * 0.6, half, half], 0xFFFFFFFF, cam_pos);
+}
+
 unsafe fn draw(dev: usize) {
     let Ok(guard) = BOARD.try_lock() else { return };
     let Some(board) = *guard else { return };
@@ -185,6 +260,36 @@ unsafe fn draw(dev: usize) {
     ];
     let ident: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 
+    // debug: what the client set as fixed-function transforms (GetTransform = slot 45)
+    {
+        let get: unsafe extern "system" fn(usize, u32, *mut f32) -> Hr = core::mem::transmute(vtbl(dev, 45));
+        let mut m = [0f32; 16];
+        if get(dev, 3, m.as_mut_ptr()) >= 0 {
+            if let Ok(mut d) = DEV_PROJ.try_lock() { *d = m; }
+        }
+        if get(dev, 2, m.as_mut_ptr()) >= 0 {
+            if let Ok(mut d) = DEV_VIEW.try_lock() { *d = m; }
+        }
+    }
+    // depth proxies for the legs (WoW's own depth buffer is not usable here): invisible boxes along the leg bones
+    let mut proxy: Vec<Vert> = Vec::new();
+    if let Ok(l) = crate::skel::LEGS.try_lock() {
+        if let Some((legs, facing)) = *l {
+            let (sn, cs) = facing.sin_cos();
+            let k = board.scale as f64;
+            let to_world = |p: [f32; 3]| -> [f64; 3] {
+                let (x, y, z) = (p[0] as f64, p[1] as f64, p[2] as f64);
+                [board.unit[0] + cs as f64 * x - sn as f64 * y, board.unit[1] + sn as f64 * x + cs as f64 * y, board.unit[2] + z]
+            };
+            let _ = k;
+            for side in legs.iter() {
+                let pts: Vec<[f64; 3]> = side.iter().map(|p| to_world(*p)).collect();
+                add_segment(&mut proxy, pts[0], pts[1], 0.10, cpos);
+                add_segment(&mut proxy, pts[1], pts[2], 0.08, cpos);
+                add_segment(&mut proxy, pts[2], pts[3], 0.07, cpos);
+            }
+        }
+    }
     // keep the client's device state intact
     let mut sb: usize = 0;
     let create: unsafe extern "system" fn(usize, u32, *mut usize) -> Hr = core::mem::transmute(vtbl(dev, VT_CREATE_STATE_BLOCK));
@@ -206,10 +311,10 @@ unsafe fn draw(dev: usize) {
     set_tss(dev, 0, 2, 0); // COLORARG1 = DIFFUSE
     set_tss(dev, 0, 4, 1); // ALPHAOP = DISABLE
     set_tss(dev, 1, 1, 1); // stage 1 off
-    let depth = DEPTH_TEST.load(Ordering::Relaxed);
+    let depth = if proxy.is_empty() { 0 } else { DEPTH_TEST.load(Ordering::Relaxed) };
     set_rs(dev, 7, depth); // ZENABLE
     set_rs(dev, 14, 0); // ZWRITEENABLE
-    set_rs(dev, 23, 4); // ZFUNC = LESSEQUAL
+    set_rs(dev, 23, ZFUNC.load(Ordering::Relaxed)); // ZFUNC (default LESSEQUAL)
     set_rs(dev, 22, 1); // CULLMODE = NONE
     set_rs(dev, 137, 0); // LIGHTING
     set_rs(dev, 27, 0); // ALPHABLENDENABLE
@@ -223,6 +328,17 @@ unsafe fn draw(dev: usize) {
     set_transform(dev, 256, &ident); // WORLD
     set_transform(dev, 2, &view); // VIEW
     set_transform(dev, 3, &proj); // PROJECTION
+    if !proxy.is_empty() && depth != 0 {
+        // our own depth: clear it, lay down the legs (no colour), then the board is depth-tested against them
+        let clear: unsafe extern "system" fn(usize, u32, *const c_void, u32, u32, f32, u32) -> Hr = core::mem::transmute(vtbl(dev, 43));
+        clear(dev, 0, core::ptr::null(), 2, 0, 1.0, 0);
+        set_rs(dev, 7, 1);
+        set_rs(dev, 14, 1);
+        set_rs(dev, 168, 0); // no colour
+        draw_up(dev, 4, (proxy.len() / 3) as u32, proxy.as_ptr() as *const c_void, core::mem::size_of::<Vert>() as u32);
+        set_rs(dev, 14, 0);
+        set_rs(dev, 168, 0xF);
+    }
     draw_up(dev, 4, (v.len() / 3) as u32, v.as_ptr() as *const c_void, core::mem::size_of::<Vert>() as u32);
 
     // restore
@@ -234,6 +350,11 @@ unsafe fn draw(dev: usize) {
 }
 
 unsafe extern "system" fn end_scene(dev: usize) -> Hr {
+    if VSC_ARM.load(Ordering::Relaxed) != 0 {
+        if let Ok(mut l) = VSC_LOG.try_lock() {
+            l.push((9999, 0, [0.0; 8]));
+        }
+    }
     draw(dev);
     let orig: unsafe extern "system" fn(usize) -> Hr = core::mem::transmute(ORIG.load(Ordering::Relaxed) as usize);
     orig(dev)
@@ -264,6 +385,7 @@ pub unsafe fn install() -> bool {
 }
 
 pub unsafe fn remove() {
+    remove_vsc();
     let slot = SLOT.swap(0, Ordering::SeqCst) as usize;
     if slot == 0 {
         return;

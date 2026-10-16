@@ -135,8 +135,11 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     }
     let mut bones_checked = 0u64;
     let mut model_tried = false;
+    let mut z_smooth: Option<f64> = None;
     let (mut force, mut force_checked) = (false, 0u64);
     let mut watch_until: Option<Instant> = None;
+    let mut vsc_until: Option<Instant> = None;
+    let mut zf_checked = 0u64;
     let mut last_gframe = u32::MAX;
     let mut prev: Option<([f64; 3], Instant)> = None;
     let mut vel = [0.0f64; 2];
@@ -262,6 +265,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             log(&format!("bone hook: {} entered, {} returned, {} on the player, {} retargeted, bones {:#x}, holder {:#x}, probe this {:#x} bones {:#x}", hook::ENTRY_CALLS.load(Ordering::Relaxed), hook::HOOK_CALLS.load(Ordering::Relaxed), hook::PLAYER_HITS.load(Ordering::Relaxed), skel::APPLIED.load(Ordering::Relaxed), hook::PLAYER_BONES.load(Ordering::Relaxed), hook::PLAYER_HOLDER.load(Ordering::Relaxed), hook::PROBE_THIS.load(Ordering::Relaxed), hook::PROBE_BONES.load(Ordering::Relaxed)));
             if let Ok(d) = skel::DEBUG.try_lock() { if !d.is_empty() { log(&format!("retarget: {}", *d)); } }
             if let Ok(d) = skel::DEBUG2.try_lock() { if !d.is_empty() { log(&format!("{}", *d)); } }
+            if let (Ok(p), Ok(v)) = (board::DEV_PROJ.try_lock(), board::DEV_VIEW.try_lock()) { log(&format!("device proj {:.4?} view {:.3?}", *p, *v)); }
             let mv = wow::local_player().and_then(wow::read_movement);
             if let Some(p) = wow::local_player() {
                 log(&format!("run speed {:?}", wow::get_speed(p)));
@@ -288,9 +292,17 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             let ok = skel::load_model();
             log(&format!("player model table: {} ({} ms)", if ok { "loaded" } else { "NOT found (unknown model: no retarget)" }, t.elapsed().as_millis()));
         }
+        if !driving {
+            z_smooth = None;
+            skel::CAM_DZ.store(0, Ordering::Relaxed);
+        }
         if driving {
             let ps = shared.read_pose();
             if ps.nparts > 0 {
+                // camera: low-pass the vertical bounce of the unit (the camera bones are shifted by the difference)
+                let zs = z_smooth.get_or_insert(acc.2);
+                *zs += (acc.2 - *zs) * (1.0 - (-dt as f64 / 0.30).exp());
+                skel::CAM_DZ.store(((*zs - acc.2) as f32).to_bits(), Ordering::Relaxed);
                 // the board: where the Skate side says it is, around the character that stands at `acc`
                 let bd = ps.parts[24];
                 let r = skel::quat_to_r3(bd.rot);
@@ -310,6 +322,34 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         }
         // debug: `skatecraft_watch.txt` arms a hardware write watchpoint on a bone matrix of the player's
         // model and logs, 3 s later, which client code wrote it
+        if now.saturating_sub(zf_checked) >= 1000 {
+            zf_checked = now;
+            if let Ok(t) = std::fs::read_to_string(format!("{}\\skatecraft_zfunc.txt", GAME_DIR.lock().unwrap())) {
+                if let Ok(v) = t.trim().parse::<u32>() {
+                    board::ZFUNC.store(v, Ordering::Relaxed);
+                    board::DEPTH_TEST.store(if v == 0 { 0 } else { 1 }, Ordering::Relaxed);
+                }
+            }
+        }
+        if vsc_until.is_some() && Instant::now() >= vsc_until.unwrap() {
+            vsc_until = None;
+            board::VSC_ARM.store(0, Ordering::Relaxed);
+            let l = board::VSC_LOG.lock().unwrap().clone();
+            log(&format!("vsc: {} uploads captured", l.len()));
+            for (r, c, f) in l.iter().take(150) {
+                log(&format!("vsc reg {r} x{c}: {:.3?}", f));
+            }
+            board::VSC_LOG.lock().unwrap().clear();
+        }
+        if vsc_until.is_none() && state.flags & wow_flags::IN_WORLD != 0 {
+            let flag = format!("{}\\skatecraft_vsc.txt", GAME_DIR.lock().unwrap());
+            if std::path::Path::new(&flag).exists() {
+                let _ = std::fs::remove_file(&flag);
+                board::VSC_LOG.lock().unwrap().clear();
+                board::VSC_ARM.store(1, Ordering::Relaxed);
+                vsc_until = Some(Instant::now() + std::time::Duration::from_millis(40));
+            }
+        }
         if watch_until.is_none() && state.flags & wow_flags::IN_WORLD != 0 {
             let game = GAME_DIR.lock().unwrap().clone();
             let flag = format!("{game}\\skatecraft_watch.txt");
