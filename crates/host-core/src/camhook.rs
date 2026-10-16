@@ -21,6 +21,26 @@ pub struct Imposed {
     pub up: [f32; 3],
     pub fov_h: f32,
     pub at_ms: u64,
+    /// when the sample was taken (seconds on `clock()`), and how fast each part was changing (per second):
+    /// the camera is extrapolated to the moment of rendering, so it moves at the render rate, not the guest's
+    pub t: f64,
+    pub vel: [f32; 3],
+    pub dfwd: [f32; 3],
+    pub dleft: [f32; 3],
+    pub dup: [f32; 3],
+    /// what the camera orbits when the player detaches it (the skater, WoW coordinates)
+    pub target: [f32; 3],
+}
+
+/// Player-controlled offset of the camera around the skater: yaw, pitch (radians) and distance multiplier (f32 bits).
+pub static ORBIT_YAW: AtomicU32 = AtomicU32::new(0);
+pub static ORBIT_PITCH: AtomicU32 = AtomicU32::new(0);
+pub static ORBIT_MULT: AtomicU32 = AtomicU32::new(0x3F80_0000); // 1.0
+
+/// Seconds since the first call (monotonic, sub-millisecond).
+pub fn clock() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
 }
 
 pub static IMPOSED: Mutex<Option<Imposed>> = Mutex::new(None);
@@ -39,10 +59,46 @@ pub unsafe fn apply() {
     if now.saturating_sub(c.at_ms) > 250 {
         return;
     }
-    *((cam + 0x08) as *mut [f32; 3]) = c.pos;
-    *((cam + 0x14) as *mut [f32; 3]) = c.fwd;
-    *((cam + 0x20) as *mut [f32; 3]) = c.left;
-    *((cam + 0x2C) as *mut [f32; 3]) = c.up;
+    let dt = ((clock() - c.t) as f32).clamp(0.0, 0.05);
+    let ex = |a: [f32; 3], v: [f32; 3]| [a[0] + v[0] * dt, a[1] + v[1] * dt, a[2] + v[2] * dt];
+    let norm = |v: [f32; 3]| {
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-6);
+        [v[0] / l, v[1] / l, v[2] / l]
+    };
+    let mut pos = ex(c.pos, c.vel);
+    let mut fwd = norm(ex(c.fwd, c.dfwd));
+    let mut left = norm(ex(c.left, c.dleft));
+    let mut up = norm(ex(c.up, c.dup));
+    let (yaw, pitch, mult) = (
+        f32::from_bits(ORBIT_YAW.load(Ordering::Relaxed)),
+        f32::from_bits(ORBIT_PITCH.load(Ordering::Relaxed)),
+        f32::from_bits(ORBIT_MULT.load(Ordering::Relaxed)),
+    );
+    if yaw.abs() > 1e-4 || pitch.abs() > 1e-4 || (mult - 1.0).abs() > 1e-3 {
+        // detached: orbit the skater (yaw about the world up axis, pitch about the sideways axis, distance scaled)
+        let t = c.target;
+        let mut v = [pos[0] - t[0], pos[1] - t[1], pos[2] - t[2]];
+        let (sy, cy) = yaw.sin_cos();
+        v = [v[0] * cy - v[1] * sy, v[0] * sy + v[1] * cy, v[2]];
+        let side = norm([-v[1], v[0], 0.0]); // horizontal, perpendicular to the view line
+        let (sp, cp) = pitch.sin_cos();
+        let dotv = side[0] * v[0] + side[1] * v[1] + side[2] * v[2];
+        let crs = [side[1] * v[2] - side[2] * v[1], side[2] * v[0] - side[0] * v[2], side[0] * v[1] - side[1] * v[0]];
+        v = [
+            v[0] * cp + crs[0] * sp + side[0] * dotv * (1.0 - cp),
+            v[1] * cp + crs[1] * sp + side[1] * dotv * (1.0 - cp),
+            v[2] * cp + crs[2] * sp + side[2] * dotv * (1.0 - cp),
+        ];
+        v = [v[0] * mult, v[1] * mult, v[2] * mult];
+        pos = [t[0] + v[0], t[1] + v[1], t[2] + v[2]];
+        fwd = norm([t[0] - pos[0], t[1] - pos[1], t[2] - pos[2]]);
+        left = norm([-fwd[1], fwd[0], 0.0]); // up x forward with up = Z
+        up = [fwd[1] * left[2] - fwd[2] * left[1], fwd[2] * left[0] - fwd[0] * left[2], fwd[0] * left[1] - fwd[1] * left[0]];
+    }
+    *((cam + 0x08) as *mut [f32; 3]) = pos;
+    *((cam + 0x14) as *mut [f32; 3]) = fwd;
+    *((cam + 0x20) as *mut [f32; 3]) = left;
+    *((cam + 0x2C) as *mut [f32; 3]) = up;
     *((cam + 0x40) as *mut f32) = c.fov_h;
     APPLIED.fetch_add(1, Ordering::Relaxed);
 }

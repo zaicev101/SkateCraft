@@ -146,6 +146,13 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut zf_checked = 0u64;
     let mut camlog_until: Option<Instant> = None;
     let (mut last_cam_frame, mut last_cam_ms) = (0u32, 0u64);
+    #[allow(clippy::type_complexity)]
+    let mut cam_prev: Option<(f64, [f32; 3], [f32; 3], [f32; 3], [f32; 3])> = None;
+    let mut cam_rates = ([0f32; 3], [0f32; 3], [0f32; 3], [0f32; 3]);
+    let mut cam_sample_t = 0f64;
+    let mut orbit_polled = 0u64;
+    let mut last_cursor: Option<(i32, i32)> = None;
+    let mut zoom_ref: Option<f32> = None;
     let mut pin_checked = 0u64;
     let mut last_gframe = u32::MAX;
     let mut prev: Option<([f64; 3], Instant)> = None;
@@ -310,12 +317,77 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             facing_s = None;
             skel::CAM_DZ.store(0, Ordering::Relaxed);
         }
+        if driving && now.saturating_sub(orbit_polled) >= 8 {
+            orbit_polled = now;
+            // detaching the camera: middle-mouse drag or numpad 4/6/8/2 orbit the skater, the wheel changes the distance, numpad 5 resets
+            use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+            use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+            let down = |vk: i32| (GetAsyncKeyState(vk) as u16 & 0x8000) != 0;
+            let (mut yaw, mut pitch) = (f32::from_bits(camhook::ORBIT_YAW.load(Ordering::Relaxed)), f32::from_bits(camhook::ORBIT_PITCH.load(Ordering::Relaxed)));
+            let step = 0.02;
+            if down(0x64) { yaw += step; }
+            if down(0x66) { yaw -= step; }
+            if down(0x68) { pitch += step; }
+            if down(0x62) { pitch -= step; }
+            let mut pt = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+            GetCursorPos(&mut pt);
+            if down(0x04) {
+                if let Some((lx, ly)) = last_cursor {
+                    yaw -= (pt.x - lx) as f32 * 0.006;
+                    pitch += (pt.y - ly) as f32 * 0.006;
+                }
+                last_cursor = Some((pt.x, pt.y));
+            } else {
+                last_cursor = None;
+            }
+            if down(0x65) {
+                yaw = 0.0;
+                pitch = 0.0;
+                zoom_ref = None;
+            }
+            yaw = yaw.clamp(-3.2, 3.2);
+            pitch = pitch.clamp(-1.2, 1.2);
+            camhook::ORBIT_YAW.store(yaw.to_bits(), Ordering::Relaxed);
+            camhook::ORBIT_PITCH.store(pitch.to_bits(), Ordering::Relaxed);
+            // wheel zoom (WoW's own zoom value) relative to what it was when skate mode started
+            let cam = board::camera_ptr();
+            if cam != 0 {
+                if let Some(z) = wow::read::<f32>(cam + 0x118).filter(|z| z.is_finite()) {
+                    // each wheel notch changes WoW's zoom value by about 1: 20% nearer / farther per notch
+                    let r = *zoom_ref.get_or_insert(z);
+                    camhook::ORBIT_MULT.store((1.0 + (z - r) * 0.2).clamp(0.15, 4.0).to_bits(), Ordering::Relaxed);
+                }
+            }
+        }
+        if !driving {
+            zoom_ref = None;
+            camhook::ORBIT_YAW.store(0, Ordering::Relaxed);
+            camhook::ORBIT_PITCH.store(0, Ordering::Relaxed);
+            camhook::ORBIT_MULT.store(0x3F80_0000, Ordering::Relaxed);
+        }
         if driving {
             // the Skate camera drives the client's camera (so the view, and the stick-relative controls, match 1:1)
             let cf = shared.read_cam();
             if cf.frame != last_cam_frame {
                 last_cam_frame = cf.frame;
                 last_cam_ms = now;
+                let tc = camhook::clock();
+                if cf.fov_v > 0.05 {
+                    let cur = ([cf.pos[0] as f32, cf.pos[1] as f32, cf.pos[2] as f32], cf.fwd, cf.left, cf.up);
+                    if let Some((pt, pp, pf, pl, pu)) = cam_prev {
+                        let dtc = (tc - pt) as f32;
+                        if dtc > 0.002 && dtc < 0.2 {
+                            let rate = |a: [f32; 3], b: [f32; 3]| [(a[0] - b[0]) / dtc, (a[1] - b[1]) / dtc, (a[2] - b[2]) / dtc];
+                            let lp = |old: [f32; 3], new: [f32; 3]| [0.5 * old[0] + 0.5 * new[0], 0.5 * old[1] + 0.5 * new[1], 0.5 * old[2] + 0.5 * new[2]];
+                            cam_rates.0 = lp(cam_rates.0, rate(cur.0, pp));
+                            cam_rates.1 = lp(cam_rates.1, rate(cur.1, pf));
+                            cam_rates.2 = lp(cam_rates.2, rate(cur.2, pl));
+                            cam_rates.3 = lp(cam_rates.3, rate(cur.3, pu));
+                        }
+                    }
+                    cam_prev = Some((tc, cur.0, cur.1, cur.2, cur.3));
+                    cam_sample_t = tc;
+                }
             }
             if cf.fov_v > 0.05 && now.saturating_sub(last_cam_ms) < 250 {
                 let cam = board::camera_ptr();
@@ -329,6 +401,12 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                         up: cf.up,
                         fov_h,
                         at_ms: now,
+                        t: cam_sample_t,
+                        vel: cam_rates.0,
+                        dfwd: cam_rates.1,
+                        dleft: cam_rates.2,
+                        dup: cam_rates.3,
+                        target: [acc.0 as f32, acc.1 as f32, acc.2 as f32 + 1.0],
                     });
                     camhook::apply();
                 }
