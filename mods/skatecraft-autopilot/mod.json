@@ -1,0 +1,9 @@
+{
+  "id": "skatecraft-autopilot",
+  "api": 2,
+  "name": "SkateCraft autopilot (test)",
+  "version": "0.1.0",
+  "author": "skatecraft",
+  "description": "Test only: pushes the skater forward and steers in a wide circle without a gamepad, so the WoW bridge can be tested unattended. F9 toggles it.",
+  "entry": "main.lua"
+}

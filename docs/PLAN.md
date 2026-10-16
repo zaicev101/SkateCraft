@@ -37,5 +37,6 @@ recompilation `mchughalex/skate3recomp` (no extension API, license not stated).
       fork reads host state, teleports the skater, publishes skater state.
 - [x] E3a: puppet movement in the client verified: a fake guest walking a circle moves the character (CMovement +0x10/+0x4C position, +0x20/+0x58 facing, +0x44 flags bit0 = forward so the client keeps sending heartbeats) and the server's `.gps` follows.
 - [ ] E3b: camera follow.
+- [x] E3c: end-to-end unattended test: engine autopilot (Lua mod, no gamepad) -> bridge -> puppet; the WoW character runs a curve over Northshire terrain, z = server ground height each frame (see tools/run-engine.ps1 -Drive).
 - [ ] E4: overlay composite (readback first, then shared texture with depth).
 - [ ] E5: collision streaming into Rapier bodies, input routing, polish.
