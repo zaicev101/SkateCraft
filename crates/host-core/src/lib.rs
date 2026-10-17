@@ -10,6 +10,7 @@ mod collide;
 mod board;
 mod camhook;
 mod hook;
+mod lua;
 mod patch;
 mod skel;
 mod watch;
@@ -76,6 +77,7 @@ pub unsafe extern "C" fn sc_stop() {
     STOP.store(true, Ordering::SeqCst);
     hook::remove();
     board::remove();
+    lua::forget();
     camhook::remove();
     for _ in 0..300 {
         if !patch::ALIVE.load(Ordering::SeqCst) {
@@ -702,6 +704,12 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         st.az = acc.2;
         st.block_seq = block_seq;
         shared.write_wow(st);
+        if let Ok(mut g) = lua::HUD.try_lock() {
+            *g = Some(shared.read_hud());
+        }
+        if let Ok(mut g) = lua::WOW.try_lock() {
+            *g = (st.map_id, st.x, st.y, st.z, st.facing);
+        }
         Sleep(if driving { 1 } else { 10 });
     }
     timeEndPeriod(1);

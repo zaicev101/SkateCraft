@@ -591,6 +591,7 @@ unsafe fn draw(dev: usize, world_depth: bool) {
 
 unsafe extern "system" fn end_scene(dev: usize) -> Hr {
     FRAMES.fetch_add(1, Ordering::Relaxed);
+    crate::lua::ensure_registered();
     if VSC_ARM.load(Ordering::Relaxed) != 0 {
         if let Ok(mut l) = VSC_LOG.try_lock() {
             l.push((9999, 0, [0.0; 8]));

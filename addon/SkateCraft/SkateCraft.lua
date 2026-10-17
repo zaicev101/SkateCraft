@@ -81,14 +81,18 @@ local function refresh()
     button:SetText(on and "Skate: ON" or "Skate: off")
 end
 
-local function set(state)
+local function set(state, keepGear)
     local was = on
     on = state and true or false
     elapsed = 0
-    if on and not was then stow() capFps() elseif was and not on then unstow() restoreFps() end
+    if not keepGear then
+        if on and not was then stow() capFps() elseif was and not on then unstow() restoreFps() end
+    end
     send(on)
     refresh()
-    DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffSkateCraft|r: skate mode " .. (on and "ON" or "off"))
+    if not keepGear then
+        DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffSkateCraft|r: skate mode " .. (on and "ON" or "off"))
+    end
 end
 
 button:SetScript("OnClick", function() set(not on) end)
@@ -112,8 +116,20 @@ end)
 SLASH_SKATECRAFT1 = "/skate"
 SlashCmdList["SKATECRAFT"] = function(msg)
     msg = string.lower(msg or "")
-    if msg == "on" then set(true) elseif msg == "off" then set(false) else set(not on) end
+    local word, rest = string.match(msg, "^(%S*)%s*(.-)$")
+    if word == "on" then set(true)
+    elseif word == "off" then set(false)
+    elseif word == "go" or word == "set" or word == "return" or word == "places" then
+        if SkateCraftPlaces then SkateCraftPlaces.command(word, rest) end
+    else set(not on) end
 end
+
+-- for Hud.lua and Places.lua
+SkateCraftAPI = {
+    isOn = function() return on end,
+    set = set,
+    anchor = button,
+}
 
 local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGOUT")

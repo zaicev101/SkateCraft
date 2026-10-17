@@ -29,6 +29,8 @@ pub const PATCH_HDR: usize = 40;
 pub const OFF_POSE: usize = 0xD4000;
 /// The Skate camera, in WoW coordinates, for the host to drive the client's camera with.
 pub const OFF_CAM: usize = 0xD8000;
+/// Score and trick names (guest -> host), and the gamepad requests (set / return to a saved place).
+pub const OFF_HUD: usize = 0xD9000;
 pub const POSE_PARTS: usize = 32;
 pub const POSE_BOARD: usize = 8;
 
@@ -194,6 +196,55 @@ pub struct CamFrame {
     pub t_us: u64,
 }
 
+
+/// The trick HUD: what the Skate scoring says right now (guest -> host), plus pad requests for the addon.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct HudFrame {
+    pub seq: u32,
+    /// bit 0: a trick sequence is running, bit 1: clean, bit 2: sketchy, bit 3: bailing
+    pub flags: u32,
+    pub landed_seq: u32,
+    pub bail_seq: u32,
+    /// advances on every gamepad request; `req_kind` 1 = remember this place, 2 = return to the remembered place,
+    /// 3 / 4 = next / previous teleport destination
+    pub req_seq: u32,
+    pub req_kind: u32,
+    pub sequence_score: f32,
+    pub line_score: f32,
+    pub multiplier: f32,
+    pub line_time: f32,
+    pub landed_points: f32,
+    pub total: f32,
+    pub speed: f32,
+    pub pad: f32,
+    pub trick: [u8; 56],
+    pub landed: [u8; 56],
+}
+
+impl Default for HudFrame {
+    fn default() -> Self {
+        Self { seq: 0, flags: 0, landed_seq: 0, bail_seq: 0, req_seq: 0, req_kind: 0, sequence_score: 0.0, line_score: 0.0, multiplier: 1.0, line_time: 0.0, landed_points: 0.0, total: 0.0, speed: 0.0, pad: 0.0, trick: [0; 56], landed: [0; 56] }
+    }
+}
+
+impl HudFrame {
+    pub fn set_text(dst: &mut [u8; 56], text: &str) {
+        let mut n = text.len().min(55);
+        while !text.is_char_boundary(n) {
+            n -= 1;
+        }
+        *dst = [0; 56];
+        dst[..n].copy_from_slice(&text.as_bytes()[..n]);
+    }
+    pub fn text(src: &[u8; 56]) -> String {
+        let n = src.iter().position(|b| *b == 0).unwrap_or(56);
+        String::from_utf8_lossy(&src[..n]).into_owned()
+    }
+}
+
+const _: () = assert!(OFF_CAM + core::mem::size_of::<CamFrame>() <= OFF_HUD);
+const _: () = assert!(OFF_HUD + core::mem::size_of::<HudFrame>() <= MAPPING_BYTES);
 const _: () = assert!(OFF_POSE + core::mem::size_of::<PoseFrame>() <= OFF_CAM);
 const _: () = assert!(OFF_CAM + core::mem::size_of::<CamFrame>() <= MAPPING_BYTES);
 const _: () = assert!(core::mem::size_of::<PatchHeader>() == PATCH_HDR);
@@ -376,6 +427,13 @@ impl Shared {
     }
     pub fn read_cam(&self) -> CamFrame {
         unsafe { self.read_slot(OFF_CAM) }
+    }
+
+    pub fn write_hud(&self, v: HudFrame) {
+        unsafe { self.write_slot(OFF_HUD, v) }
+    }
+    pub fn read_hud(&self) -> HudFrame {
+        unsafe { self.read_slot(OFF_HUD) }
     }
 
     pub fn write_pose(&self, v: PoseFrame) {
