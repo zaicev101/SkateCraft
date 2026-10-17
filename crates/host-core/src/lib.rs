@@ -147,6 +147,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut vsc_until: Option<Instant> = None;
     let mut zf_checked = 0u64;
     let mut camlog_until: Option<Instant> = None;
+    let mut viewlog_until: Option<Instant> = None;
     let (mut last_cam_t, mut last_cam_ms) = (0u64, 0u64);
     let (mut cam_s0, mut cam_s1) = (camhook::CamSample::default(), camhook::CamSample::default());
     let mut cam_delay = 16_700.0f64;
@@ -487,6 +488,27 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 .map(|t| t.split(',').filter_map(|x| x.trim().parse().ok()).collect())
                 .unwrap_or_default();
             *skel::EXTRA_PIN.lock().unwrap() = v;
+        }
+        if viewlog_until.is_some() && Instant::now() >= viewlog_until.unwrap() {
+            viewlog_until = None;
+            board::VIEWLOG_ARM.store(0, Ordering::Relaxed);
+            let rows = board::VIEWLOG.lock().unwrap().clone();
+            let mut csv = String::from("t,r0,r1,r2,u0,u1,u2,f0,f1,f2,tx,ty,tz
+");
+            for r in &rows {
+                csv += &r.iter().map(|v| format!("{v:.5}")).collect::<Vec<_>>().join(",");
+                csv += "
+";
+            }
+            let _ = std::fs::write(format!(r"{}\skatecraft_view.csv", GAME_DIR.lock().unwrap()), csv);
+            log(&format!("view log: {} frames written", rows.len()));
+            board::VIEWLOG.lock().unwrap().clear();
+        }
+        if viewlog_until.is_none() && std::path::Path::new(&format!(r"{}\skatecraft_viewlog.txt", GAME_DIR.lock().unwrap())).exists() {
+            let _ = std::fs::remove_file(format!(r"{}\skatecraft_viewlog.txt", GAME_DIR.lock().unwrap()));
+            board::VIEWLOG.lock().unwrap().clear();
+            board::VIEWLOG_ARM.store(1, Ordering::Relaxed);
+            viewlog_until = Some(Instant::now() + std::time::Duration::from_millis(3000));
         }
         if camlog_until.is_some() && Instant::now() >= camlog_until.unwrap() {
             camlog_until = None;

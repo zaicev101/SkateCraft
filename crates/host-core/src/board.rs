@@ -46,6 +46,11 @@ pub static EVENTS: Mutex<Vec<(u8, u32)>> = Mutex::new(Vec::new());
 static ORIG_DIP: AtomicU32 = AtomicU32::new(0);
 static SLOT_DIP: AtomicU32 = AtomicU32::new(0);
 
+/// debug: the view matrix the GPU gets for the world pass, per frame (dumped to a CSV by the worker)
+pub static VIEWLOG: Mutex<Vec<[f32; 13]>> = Mutex::new(Vec::new());
+pub static VIEWLOG_ARM: AtomicU32 = AtomicU32::new(0);
+static LAST_VIEW: Mutex<[f32; 16]> = Mutex::new([0.0; 16]);
+
 /// 0 = none yet, 1 = perspective (3D world / models), 2 = orthographic (UI), 3 = other
 static LAST_KIND: AtomicU32 = AtomicU32::new(0);
 /// draw calls since the last perspective projection was set
@@ -54,6 +59,11 @@ static PERSP_DRAWS: AtomicU32 = AtomicU32::new(0);
 static DRAWN_FRAME: AtomicU32 = AtomicU32::new(0);
 
 unsafe extern "system" fn set_vsc(dev: usize, state: u32, data: *const f32) -> Hr {
+    if state == 2 && LAST_KIND.load(Ordering::Relaxed) == 1 {
+        if let Ok(mut v) = LAST_VIEW.try_lock() {
+            v.copy_from_slice(core::slice::from_raw_parts(data, 16));
+        }
+    }
     if state == 3 {
         let m = core::slice::from_raw_parts(data, 16);
         // 1 = perspective (m[11] == 1), 2 = orthographic (m[15] == 1)
@@ -72,6 +82,14 @@ unsafe extern "system" fn set_vsc(dev: usize, state: u32, data: *const f32) -> H
             && PERSP_DRAWS.load(Ordering::Relaxed) >= 50
             && DRAWN_FRAME.swap(1, Ordering::Relaxed) == 0
         {
+            if VIEWLOG_ARM.load(Ordering::Relaxed) != 0 {
+                if let (Ok(v), Ok(mut l)) = (LAST_VIEW.try_lock(), VIEWLOG.try_lock()) {
+                    if l.len() < 600 {
+                        let t = windows_sys::Win32::System::SystemInformation::GetTickCount64() as f32;
+                        l.push([t, v[0], v[1], v[2], v[4], v[5], v[6], v[8], v[9], v[10], v[12], v[13], v[14]]);
+                    }
+                }
+            }
             draw(dev, true);
         }
         if kind == 1 {
@@ -461,7 +479,7 @@ unsafe fn draw(dev: usize, world_depth: bool) {
     set_tss(dev, 0, 2, 0); // COLORARG1 = DIFFUSE
     set_tss(dev, 0, 4, 1); // ALPHAOP = DISABLE
     set_tss(dev, 1, 1, 1); // stage 1 off
-    let depth = if world_depth { 1 } else if proxy.is_empty() { 0 } else { DEPTH_TEST.load(Ordering::Relaxed) };
+    let depth = if world_depth { DEPTH_TEST.load(Ordering::Relaxed) } else if proxy.is_empty() { 0 } else { DEPTH_TEST.load(Ordering::Relaxed) };
     set_rs(dev, 7, depth); // ZENABLE
     set_rs(dev, 14, 0); // ZWRITEENABLE
     set_rs(dev, 23, ZFUNC.load(Ordering::Relaxed)); // ZFUNC (default LESSEQUAL)

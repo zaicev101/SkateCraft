@@ -95,7 +95,7 @@ pub unsafe fn apply() {
         let (sy, cy) = yaw.sin_cos();
         v = [v[0] * cy - v[1] * sy, v[0] * sy + v[1] * cy, v[2]];
         let side = norm([-v[1], v[0], 0.0]); // horizontal, perpendicular to the view line
-        let (sp, cp) = pitch.sin_cos();
+        let (sp, cp) = (-pitch).sin_cos(); // positive pitch raises the camera
         let dotv = side[0] * v[0] + side[1] * v[1] + side[2] * v[2];
         let crs = [side[1] * v[2] - side[2] * v[1], side[2] * v[0] - side[0] * v[2], side[0] * v[1] - side[1] * v[0]];
         v = [
