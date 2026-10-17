@@ -128,13 +128,15 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     *patch::REQUEST.lock().unwrap() = None;
     patch::spawn_builder(data.clone());
     let mut patch_at: Option<(u32, f64, f64)> = None;
+    let mut board_hooked = false;
     let nohook = std::path::Path::new(&format!("{}\\skatecraft_nohook.txt", GAME_DIR.lock().unwrap())).exists();
     if nohook {
         log("bone hook skipped (skatecraft_nohook.txt)");
     } else {
         log(if hook::install() { "bone hook installed" } else { "bone hook NOT installed (unknown client build?)" });
         log(if camhook::install() { "camera hooks installed" } else { "camera hooks NOT installed" });
-        log(if board::install() { "board drawing hooked (EndScene)" } else { "board drawing NOT hooked" });
+        board_hooked = board::install() && board::install_vsc();
+        log(if board_hooked { "board drawing hooked (EndScene, SetTransform)" } else { "board drawing not hooked yet (the device is created later: retrying)" });
     }
     let mut bones_checked = 0u64;
     let mut model_tried = false;
@@ -153,6 +155,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut zoom_ref: Option<f32> = None;
     let mut pin_checked = 0u64;
     let mut off_checked = 0u64;
+    let mut board_retry = 0u64;
     let mut last_frames = 0u32;
     let mut last_gframe = u32::MAX;
     let mut last_gt = 0u64;
@@ -294,6 +297,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             log(&format!("bone hook: {} entered, {} returned, {} on the player, {} retargeted, bones {:#x}, holder {:#x}, probe this {:#x} bones {:#x}", hook::ENTRY_CALLS.load(Ordering::Relaxed), hook::HOOK_CALLS.load(Ordering::Relaxed), hook::PLAYER_HITS.load(Ordering::Relaxed), skel::APPLIED.load(Ordering::Relaxed), hook::PLAYER_BONES.load(Ordering::Relaxed), hook::PLAYER_HOLDER.load(Ordering::Relaxed), hook::PROBE_THIS.load(Ordering::Relaxed), hook::PROBE_BONES.load(Ordering::Relaxed)));
             if let Ok(d) = skel::DEBUG.try_lock() { if !d.is_empty() { log(&format!("retarget: {}", *d)); } }
             { let f = board::FRAMES.load(Ordering::Relaxed); log(&format!("fps {}", f.wrapping_sub(last_frames))); last_frames = f; }
+            log(&format!("retarget skips: stale pose {}, locked {}, no targets {}, bad array {}", skel::SKIPS[0].load(Ordering::Relaxed), skel::SKIPS[1].load(Ordering::Relaxed), skel::SKIPS[2].load(Ordering::Relaxed), skel::SKIPS[3].load(Ordering::Relaxed)));
             log(&format!("retarget safety: {} bad matrices, last bone {}", skel::BAD_COUNT.load(Ordering::Relaxed), skel::BAD_BONE.load(Ordering::Relaxed) as i32 - 1));
             if let Ok(d) = skel::DEBUG2.try_lock() { if !d.is_empty() { log(&format!("{}", *d)); } }
             if let (Ok(p), Ok(v)) = (board::DEV_PROJ.try_lock(), board::DEV_VIEW.try_lock()) { log(&format!("device proj {:.4?} view {:.3?}", *p, *v)); }
@@ -312,10 +316,15 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         }
         if now.saturating_sub(bones_checked) >= 20 {
             bones_checked = now;
-            let b = wow::local_player().and_then(wow::bone_array).unwrap_or(0) as u32;
-            hook::PLAYER_BONES.store(b, Ordering::Relaxed);
-            let holder = wow::local_player().and_then(|p| wow::read::<u32>(p + wow::OBJ_MODEL)).unwrap_or(0);
-            hook::PLAYER_HOLDER.store(holder, Ordering::Relaxed);
+            // keep the last good values: a failed lookup must not make the hook skip frames (the model would flicker)
+            if let Some(pl) = wow::local_player() {
+                if let Some(b) = wow::bone_array(pl) {
+                    hook::PLAYER_BONES.store(b as u32, Ordering::Relaxed);
+                }
+                if let Some(holder) = wow::read::<u32>(pl + wow::OBJ_MODEL).filter(|h| *h != 0) {
+                    hook::PLAYER_HOLDER.store(holder, Ordering::Relaxed);
+                }
+            }
         }
         if !nohook && !model_tried && b_ready(&state) {
             model_tried = true;
@@ -458,6 +467,13 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 }
             }
         }
+        if !nohook && !board_hooked && now.saturating_sub(board_retry) >= 1000 {
+            board_retry = now;
+            board_hooked = board::install() && board::install_vsc();
+            if board_hooked {
+                log("board drawing hooked (EndScene, SetTransform)");
+            }
+        }
         if now.saturating_sub(off_checked) >= 1000 {
             off_checked = now;
             let t = std::fs::read_to_string(format!(r"{}\skatecraft_off.txt", GAME_DIR.lock().unwrap())).unwrap_or_default();
@@ -495,20 +511,31 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
         if vsc_until.is_some() && Instant::now() >= vsc_until.unwrap() {
             vsc_until = None;
             board::VSC_ARM.store(0, Ordering::Relaxed);
-            let l = board::VSC_LOG.lock().unwrap().clone();
-            log(&format!("vsc: {} uploads captured", l.len()));
-            for (r, c, f) in l.iter().take(150) {
-                log(&format!("vsc reg {r} x{c}: {:.3?}", f));
+            let ev = board::EVENTS.lock().unwrap().clone();
+            // run-length: P1/P2/P3 (perspective / ortho / other projection), Dn (n draws), E (EndScene)
+            let mut out = String::new();
+            let mut i = 0;
+            while i < ev.len() {
+                let (k, v) = ev[i];
+                if k == b'D' {
+                    let mut n = 0;
+                    while i < ev.len() && ev[i].0 == b'D' { n += 1; i += 1; }
+                    out += &format!("D{n} ");
+                } else {
+                    out += &format!("{}{} ", k as char, if k == b'P' { v } else { 0 });
+                    i += 1;
+                }
             }
-            board::VSC_LOG.lock().unwrap().clear();
+            log(&format!("frame events: {out}"));
+            board::EVENTS.lock().unwrap().clear();
         }
         if vsc_until.is_none() && state.flags & wow_flags::IN_WORLD != 0 {
             let flag = format!("{}\\skatecraft_vsc.txt", GAME_DIR.lock().unwrap());
             if std::path::Path::new(&flag).exists() {
                 let _ = std::fs::remove_file(&flag);
-                board::VSC_LOG.lock().unwrap().clear();
+                board::EVENTS.lock().unwrap().clear();
                 board::VSC_ARM.store(1, Ordering::Relaxed);
-                vsc_until = Some(Instant::now() + std::time::Duration::from_millis(40));
+                vsc_until = Some(Instant::now() + std::time::Duration::from_millis(12));
             }
         }
         if watch_until.is_none() && state.flags & wow_flags::IN_WORLD != 0 {

@@ -39,6 +39,7 @@ pub static BAD_BONE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 pub static BAD_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// debug switch (`skatecraft_off.txt` containing `bones`): leave the client's own animation alone
 pub static DISABLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub static SKIPS: [core::sync::atomic::AtomicU32; 4] = [const { core::sync::atomic::AtomicU32::new(0) }; 4];
 pub static APPLIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 const NBONES: usize = 228;
@@ -278,6 +279,7 @@ pub unsafe fn load_model() -> bool {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     let needle: [u8; 8] = [b'M', b'D', b'2', b'0', 0x08, 0x01, 0x00, 0x00];
     let mut addr = 0x0001_0000usize;
+    let mut buf: Vec<u8> = vec![0; 0x10_0000 + 8];
     while addr < 0x7FFE_0000 {
         let mut mbi: MEMORY_BASIC_INFORMATION = core::mem::zeroed();
         if VirtualQuery(addr as *const _, &mut mbi, core::mem::size_of::<MEMORY_BASIC_INFORMATION>()) == 0 {
@@ -286,16 +288,22 @@ pub unsafe fn load_model() -> bool {
         let (base, size) = (mbi.BaseAddress as usize, mbi.RegionSize);
         let readable = mbi.State == MEM_COMMIT && mbi.Protect & 0x66 != 0 && mbi.Protect & 0x101 == 0; // R/RW/WC
         if readable && size >= 0x100 {
-            let hay = core::slice::from_raw_parts(base as *const u8, size);
-            let mut i = 0;
-            while i + 0x40 <= size {
-                if hay[i..i + 8] == needle {
-                    if let Some(m) = parse(base + i) {
-                        *MODEL.lock().unwrap() = Some(m);
-                        return true;
+            // read in 1 MiB chunks with ReadProcessMemory: a page that vanishes meanwhile just fails the read
+            let mut off = 0usize;
+            while off < size {
+                let n = (size - off).min(0x10_0000);
+                let got = read_bytes(base + off, &mut buf[..n]);
+                let mut i = 0;
+                while i + 0x40 <= got {
+                    if buf[i..i + 8] == needle {
+                        if let Some(m) = parse(base + off + i) {
+                            *MODEL.lock().unwrap() = Some(m);
+                            return true;
+                        }
                     }
+                    i += 4;
                 }
-                i += 4;
+                off += n;
             }
         }
         addr = base + size;
@@ -303,19 +311,36 @@ pub unsafe fn load_model() -> bool {
     false
 }
 
+fn read_bytes(addr: usize, out: &mut [u8]) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut got = 0usize;
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), addr as *const _, out.as_mut_ptr() as *mut _, out.len(), &mut got) };
+    if ok != 0 { got } else { got }
+}
+
 unsafe fn parse(h: usize) -> Option<Model> {
-    let rd = |a: usize| -> u32 { *(a as *const u32) };
-    let n = rd(h + 0x2C) as usize;
-    let ob = rd(h + 0x30) as usize;
+    let mut head = [0u8; 0x40];
+    if read_bytes(h, &mut head) < 0x40 {
+        return None;
+    }
+    let rd = |o: usize| u32::from_le_bytes(head[o..o + 4].try_into().unwrap());
+    let n = rd(0x2C) as usize;
+    let ob = rd(0x30) as usize;
     if n != NBONES || !(0x10000..0x7FFE_0000).contains(&ob) {
+        return None;
+    }
+    let mut raw = vec![0u8; n * 0x58];
+    if read_bytes(ob, &mut raw) < raw.len() {
         return None;
     }
     let mut pivot = Vec::with_capacity(n);
     let mut parent = Vec::with_capacity(n);
     for i in 0..n {
-        let b = ob + i * 0x58;
-        parent.push(*((b + 8) as *const i16) as i32);
-        pivot.push([*((b + 0x4C) as *const f32), *((b + 0x50) as *const f32), *((b + 0x54) as *const f32)]);
+        let b = &raw[i * 0x58..(i + 1) * 0x58];
+        parent.push(i16::from_le_bytes([b[8], b[9]]) as i32);
+        let f = |o: usize| f32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        pivot.push([f(0x4C), f(0x50), f(0x54)]);
     }
     // sanity: the head sits high on the centre line, the right thigh is on the right
     let (hp, tp) = (pivot[HEAD], pivot[THIGH[0]]);
@@ -457,15 +482,23 @@ pub unsafe fn apply(base: usize) {
     }
     let now = windows_sys::Win32::System::SystemInformation::GetTickCount64();
     if now.saturating_sub(POSE_AT.load(Ordering::Relaxed)) > 300 {
+        SKIPS[0].fetch_add(1, Ordering::Relaxed);
         return; // no fresh pose: leave the client's own animation
     }
-    let (Ok(model), Ok(pose)) = (MODEL.try_lock(), POSE.try_lock()) else { return };
+    let (Ok(model), Ok(pose)) = (MODEL.try_lock(), POSE.try_lock()) else {
+        SKIPS[1].fetch_add(1, Ordering::Relaxed);
+        return;
+    };
     let (Some(model), Some(pose)) = (model.as_ref(), pose.as_ref()) else { return };
-    let Some(t) = targets(model, pose) else { return };
+    let Some(t) = targets(model, pose) else {
+        SKIPS[2].fetch_add(1, Ordering::Relaxed);
+        return;
+    };
 
     let mats = core::slice::from_raw_parts_mut(base as *mut Mat, NBONES);
     let w = mats[0];
     if !looks_rigid(&w) || !looks_rigid(&mats[HEAD]) || !looks_rigid(&mats[THIGH[0]]) {
+        SKIPS[3].fetch_add(1, Ordering::Relaxed);
         return; // not a bone array (stale pointer): never write into unknown memory
     }
     let wi = inv_rigid(&w);

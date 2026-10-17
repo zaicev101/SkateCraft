@@ -41,24 +41,71 @@ pub static VSC_ARM: AtomicU32 = AtomicU32::new(0);
 static ORIG_VSC: AtomicU32 = AtomicU32::new(0);
 static SLOT_VSC: AtomicU32 = AtomicU32::new(0);
 
-/// debug: hook of Clear (slot 43) to see when the depth buffer is cleared relative to EndScene
-unsafe extern "system" fn set_vsc(dev: usize, count: u32, rects: *const c_void, flags: u32, color: u32, z: f32, stencil: u32) -> Hr {
+/// debug: record the order of projection changes and draw calls in one frame (slots 44 SetTransform, 82 DrawIndexedPrimitive)
+pub static EVENTS: Mutex<Vec<(u8, u32)>> = Mutex::new(Vec::new());
+static ORIG_DIP: AtomicU32 = AtomicU32::new(0);
+static SLOT_DIP: AtomicU32 = AtomicU32::new(0);
+
+/// 0 = none yet, 1 = perspective (3D world / models), 2 = orthographic (UI), 3 = other
+static LAST_KIND: AtomicU32 = AtomicU32::new(0);
+/// draw calls since the last perspective projection was set
+static PERSP_DRAWS: AtomicU32 = AtomicU32::new(0);
+/// the board was already drawn this frame (reset at EndScene)
+static DRAWN_FRAME: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "system" fn set_vsc(dev: usize, state: u32, data: *const f32) -> Hr {
+    if state == 3 {
+        let m = core::slice::from_raw_parts(data, 16);
+        // 1 = perspective (m[11] == 1), 2 = orthographic (m[15] == 1)
+        let kind = if (m[11] - 1.0).abs() < 1e-3 { 1 } else if (m[15] - 1.0).abs() < 1e-3 { 2 } else { 3 };
+        if VSC_ARM.load(Ordering::Relaxed) != 0 {
+            if let Ok(mut l) = EVENTS.try_lock() {
+                if l.len() < 3000 {
+                    l.push((b'P', kind));
+                }
+            }
+        }
+        // the world pass ends where the interface starts: the first orthographic projection after a long run of perspective
+        // draws. The board is drawn right there, against WoW's own depth buffer and before any UI.
+        if kind == 2
+            && LAST_KIND.load(Ordering::Relaxed) == 1
+            && PERSP_DRAWS.load(Ordering::Relaxed) >= 50
+            && DRAWN_FRAME.swap(1, Ordering::Relaxed) == 0
+        {
+            draw(dev, true);
+        }
+        if kind == 1 {
+            PERSP_DRAWS.store(0, Ordering::Relaxed);
+        }
+        LAST_KIND.store(kind, Ordering::Relaxed);
+    }
+    let orig: unsafe extern "system" fn(usize, u32, *const f32) -> Hr = core::mem::transmute(ORIG_VSC.load(Ordering::Relaxed) as usize);
+    orig(dev, state, data)
+}
+
+unsafe extern "system" fn dip_hook(dev: usize, a: u32, b: i32, c: u32, d: u32, e: u32, f: u32) -> Hr {
+    if LAST_KIND.load(Ordering::Relaxed) == 1 {
+        PERSP_DRAWS.fetch_add(1, Ordering::Relaxed);
+    }
     if VSC_ARM.load(Ordering::Relaxed) != 0 {
-        if let Ok(mut l) = VSC_LOG.try_lock() {
-            if l.len() < 400 {
-                l.push((flags, count, [z, stencil as f32, color as f32, 0.0, 0.0, 0.0, 0.0, 0.0]));
+        if let Ok(mut l) = EVENTS.try_lock() {
+            if l.len() < 3000 {
+                l.push((b'D', 1));
             }
         }
     }
-    let orig: unsafe extern "system" fn(usize, u32, *const c_void, u32, u32, f32, u32) -> Hr = core::mem::transmute(ORIG_VSC.load(Ordering::Relaxed) as usize);
-    orig(dev, count, rects, flags, color, z, stencil)
+    let orig: unsafe extern "system" fn(usize, i32, i32, u32, u32, u32, u32) -> Hr = core::mem::transmute(ORIG_DIP.load(Ordering::Relaxed) as usize);
+    orig(dev, a as i32, b, c, d, e, f)
 }
 
 pub unsafe fn install_vsc() -> bool {
+    if SLOT_VSC.load(Ordering::SeqCst) != 0 {
+        return true;
+    }
     let Some(gx) = rd::<u32>(GLOBAL_GX) else { return false };
     let Some(dev) = rd::<u32>(gx as usize + GX_DEVICE) else { return false };
     let vt = *(dev as usize as *const usize);
-    let slot = vt + 43 * 4;
+    let slot = vt + 44 * 4;
     let orig = *(slot as *const usize);
     let mut old = 0u32;
     VirtualProtect(slot as _, 4, PAGE_EXECUTE_READWRITE, &mut old);
@@ -66,10 +113,25 @@ pub unsafe fn install_vsc() -> bool {
     *(slot as *mut usize) = set_vsc as usize;
     VirtualProtect(slot as _, 4, old, &mut old);
     SLOT_VSC.store(slot as u32, Ordering::SeqCst);
+    let slot2 = vt + 82 * 4;
+    let orig2 = *(slot2 as *const usize);
+    let mut old2 = 0u32;
+    VirtualProtect(slot2 as _, 4, PAGE_EXECUTE_READWRITE, &mut old2);
+    ORIG_DIP.store(orig2 as u32, Ordering::SeqCst);
+    *(slot2 as *mut usize) = dip_hook as usize;
+    VirtualProtect(slot2 as _, 4, old2, &mut old2);
+    SLOT_DIP.store(slot2 as u32, Ordering::SeqCst);
     true
 }
 
 pub unsafe fn remove_vsc() {
+    let slot2 = SLOT_DIP.swap(0, Ordering::SeqCst) as usize;
+    if slot2 != 0 {
+        let mut old = 0u32;
+        VirtualProtect(slot2 as _, 4, PAGE_EXECUTE_READWRITE, &mut old);
+        *(slot2 as *mut usize) = ORIG_DIP.load(Ordering::SeqCst) as usize;
+        VirtualProtect(slot2 as _, 4, old, &mut old);
+    }
     let slot = SLOT_VSC.swap(0, Ordering::SeqCst) as usize;
     if slot == 0 {
         return;
@@ -287,7 +349,7 @@ unsafe fn deck_texture(dev: usize) -> usize {
     tex
 }
 
-unsafe fn draw(dev: usize) {
+unsafe fn draw(dev: usize, world_depth: bool) {
     if DISABLED.load(Ordering::Relaxed) != 0 {
         return;
     }
@@ -335,11 +397,13 @@ unsafe fn draw(dev: usize) {
     // the client's fov is the horizontal one
     let xs = 1.0 / (fov * 0.5).tan();
     let ys = xs * aspect;
+    let _ = far;
+    // WoW's world projection has an infinite far plane: z' = (z - near) / z
     let proj: [f32; 16] = [
         xs, 0.0, 0.0, 0.0, //
         0.0, ys, 0.0, 0.0, //
-        0.0, 0.0, far / (far - near), 1.0, //
-        0.0, 0.0, -near * far / (far - near), 0.0,
+        0.0, 0.0, 1.0, 1.0, //
+        0.0, 0.0, -near, 0.0,
     ];
     let ident: [f32; 16] = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
 
@@ -356,7 +420,9 @@ unsafe fn draw(dev: usize) {
     }
     // depth proxies for the legs (WoW's own depth buffer is not usable here): invisible boxes along the leg bones
     let mut proxy: Vec<Vert> = Vec::new();
-    if let Ok(l) = crate::skel::LEGS.try_lock() {
+    if world_depth {
+        // WoW's own depth buffer is valid here: no stand-in geometry needed
+    } else if let Ok(l) = crate::skel::LEGS.try_lock() {
         if let Some((legs, facing)) = *l {
             let (sn, cs) = facing.sin_cos();
             let k = board.scale as f64;
@@ -395,7 +461,7 @@ unsafe fn draw(dev: usize) {
     set_tss(dev, 0, 2, 0); // COLORARG1 = DIFFUSE
     set_tss(dev, 0, 4, 1); // ALPHAOP = DISABLE
     set_tss(dev, 1, 1, 1); // stage 1 off
-    let depth = if proxy.is_empty() { 0 } else { DEPTH_TEST.load(Ordering::Relaxed) };
+    let depth = if world_depth { 1 } else if proxy.is_empty() { 0 } else { DEPTH_TEST.load(Ordering::Relaxed) };
     set_rs(dev, 7, depth); // ZENABLE
     set_rs(dev, 14, 0); // ZWRITEENABLE
     set_rs(dev, 23, ZFUNC.load(Ordering::Relaxed)); // ZFUNC (default LESSEQUAL)
@@ -458,8 +524,15 @@ unsafe extern "system" fn end_scene(dev: usize) -> Hr {
         if let Ok(mut l) = VSC_LOG.try_lock() {
             l.push((9999, 0, [0.0; 8]));
         }
+        if let Ok(mut l) = EVENTS.try_lock() {
+            l.push((b'E', 0));
+        }
     }
-    draw(dev);
+    if DRAWN_FRAME.swap(0, Ordering::Relaxed) == 0 {
+        draw(dev, false); // the world/UI boundary was not seen this frame: fall back to the end-of-frame draw
+    }
+    PERSP_DRAWS.store(0, Ordering::Relaxed);
+    LAST_KIND.store(0, Ordering::Relaxed);
     let orig: unsafe extern "system" fn(usize) -> Hr = core::mem::transmute(ORIG.load(Ordering::Relaxed) as usize);
     orig(dev)
 }
