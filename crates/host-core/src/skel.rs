@@ -73,7 +73,9 @@ pub static APPLIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 
 const NBONES: usize = 228;
 /// WoW's ankle sits ~0.11 above the sole, Skate's foot bone is at the sole: lift the ankles so the soles rest on the deck
-const ANKLE_LIFT: f32 = 0.06;
+/// how much higher than the Skate skater's ankles the WoW model's ankles are held (WoW boots are taller)
+pub static ANKLE_LIFT_BITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0x3DE147AE); // 0.11
+
 /// attachment bones that carry weapons/shields (hands, sheaths on the back and hips): collapsed to nothing
 const WEAPON_BONES: [usize; 11] = [212, 218, 219, 193, 194, 195, 196, 197, 173, 174, 198];
 /// the camera follows these ($CHD, $CCH): held in the neutral pose so the camera does not shake with the skater's motion
@@ -470,7 +472,8 @@ fn targets(m: &Model, p: &PoseFrame) -> Option<Targets> {
             r_pelvis[0][0], r_pelvis[1][1], r_pelvis[2][2]
         );
     }
-    Some(Targets { rot, joint_pelvis: qs(S_HIPS), ankle_z: [qs(S_FOOT[0])[2] + ANKLE_LIFT, qs(S_FOOT[1])[2] + ANKLE_LIFT] })
+    let lift = f32::from_bits(ANKLE_LIFT_BITS.load(Ordering::Relaxed));
+    Some(Targets { rot, joint_pelvis: qs(S_HIPS), ankle_z: [qs(S_FOOT[0])[2] + lift, qs(S_FOOT[1])[2] + lift] })
 }
 
 pub fn quat_to_r3(q: [f32; 4]) -> R3 {
@@ -503,6 +506,10 @@ fn forward(model: &Model, t: &Targets, b_client: &[Mat]) -> Vec<Mat> {
     }
     b_new
 }
+
+/// The player's model matrix (bone 0) as the client computed it this frame
+pub static DEBUG3: Mutex<String> = Mutex::new(String::new());
+pub static HERO_W: Mutex<Mat> = Mutex::new([0.0; 16]);
 
 /// Called from the hook right after the client filled `base` (bone matrices of the local player).
 pub unsafe fn apply(base: usize) {
@@ -541,6 +548,9 @@ pub unsafe fn apply(base: usize) {
         SKIPS[3].fetch_add(1, Ordering::Relaxed);
         return; // not a bone array (stale pointer): never write into unknown memory
     }
+    if let Ok(mut h) = HERO_W.try_lock() {
+        *h = w;
+    }
     let wi = inv_rigid(&w);
     // model-space transforms as the client computed them
     let b_client: Vec<Mat> = mats.iter().map(|m| mul(m, &wi)).collect();
@@ -563,6 +573,10 @@ pub unsafe fn apply(base: usize) {
     if err.is_finite() && err.abs() > 0.003 {
         t.joint_pelvis[2] += err;
         b_new = forward(model, &t, &b_client);
+    }
+    if let Ok(mut d) = DEBUG3.try_lock() {
+        let z = |b: usize| point(model.pivot[b], &b_new[b])[2];
+        *d = format!("after match: ankle z {:.3}/{:.3} toe z {:.3}/{:.3} pelvis {:.3} k {:.3}", z(FOOT[0][0]), z(FOOT[1][0]), z(TOE[0]), z(TOE[1]), t.joint_pelvis[2], model_scale());
     }
     if APPLYLOG_ARM.load(Ordering::Relaxed) != 0 {
         if let Ok(mut l) = APPLYLOG.try_lock() {

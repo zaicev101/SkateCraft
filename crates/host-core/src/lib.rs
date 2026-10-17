@@ -298,6 +298,23 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             }
             log(&format!("bone hook: {} entered, {} returned, {} on the player, {} retargeted, bones {:#x}, holder {:#x}, probe this {:#x} bones {:#x}", hook::ENTRY_CALLS.load(Ordering::Relaxed), hook::HOOK_CALLS.load(Ordering::Relaxed), hook::PLAYER_HITS.load(Ordering::Relaxed), skel::APPLIED.load(Ordering::Relaxed), hook::PLAYER_BONES.load(Ordering::Relaxed), hook::PLAYER_HOLDER.load(Ordering::Relaxed), hook::PROBE_THIS.load(Ordering::Relaxed), hook::PROBE_BONES.load(Ordering::Relaxed)));
             if let Ok(d) = skel::DEBUG.try_lock() { if !d.is_empty() { log(&format!("retarget: {}", *d)); } }
+            if let Some(b) = *board::BOARD.lock().unwrap() {
+                log(&format!("board pose: rel {:.2?} axes {:.2?} scale {:.2}", [b.pos[0] - b.unit[0], b.pos[1] - b.unit[1], b.pos[2] - b.unit[2]], b.axes, b.scale));
+            }
+            // debug tuning: skatecraft_lift.txt = "<ankle lift> <deck lift>" (metres)
+            if let Ok(t) = std::fs::read_to_string(format!(r"{}\skatecraft_lift.txt", GAME_DIR.lock().unwrap())) {
+                let v: Vec<f32> = t.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+                if v.len() >= 2 {
+                    skel::ANKLE_LIFT_BITS.store(v[0].to_bits(), Ordering::Relaxed);
+                    board::DECK_LIFT.store(v[1].to_bits(), Ordering::Relaxed);
+                }
+            }
+            if let Ok(d) = board::DBG_BOARD.try_lock() { log(&format!("board proj: {}", *d)); }
+            if let Ok(d) = skel::DEBUG3.try_lock() { log(&d); }
+            if let Ok(h) = skel::HERO_W.try_lock() { log(&format!("hero W {:.3?}", *h)); }
+            board::NO_BOUNDARY.store(std::path::Path::new(&format!(r"{}\skatecraft_boundary.txt", GAME_DIR.lock().unwrap())).exists() as u32 ^ 1, Ordering::Relaxed);
+            board::DEBUG_MARKER.store(std::path::Path::new(&format!(r"{}\skatecraft_marker.txt", GAME_DIR.lock().unwrap())).exists() as u32, Ordering::Relaxed);
+            if board_hooked && unsafe { board::recheck() } { log("board hooks reinstalled (the client recreated its device)"); }
             { let f = board::FRAMES.load(Ordering::Relaxed); log(&format!("fps {}", f.wrapping_sub(last_frames))); last_frames = f; }
             log(&format!("retarget skips: stale pose {}, locked {}, no targets {}, bad array {}", skel::SKIPS[0].load(Ordering::Relaxed), skel::SKIPS[1].load(Ordering::Relaxed), skel::SKIPS[2].load(Ordering::Relaxed), skel::SKIPS[3].load(Ordering::Relaxed)));
             log(&format!("board draw stages: called {}, disabled {}, no pose {}, stale {}, no camera {}, state block failed {}, drawn {}", board::DRAW_STAGES[0].load(Ordering::Relaxed), board::DRAW_STAGES[1].load(Ordering::Relaxed), board::DRAW_STAGES[2].load(Ordering::Relaxed), board::DRAW_STAGES[3].load(Ordering::Relaxed), board::DRAW_STAGES[4].load(Ordering::Relaxed), board::DRAW_STAGES[5].load(Ordering::Relaxed), board::DRAW_STAGES[6].load(Ordering::Relaxed)));

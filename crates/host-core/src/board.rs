@@ -33,6 +33,10 @@ pub static DRAW_STAGES: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
 /// EndScene calls (= frames), for the fps readout
 pub static FRAMES: AtomicU32 = AtomicU32::new(0);
 pub static ZFUNC: AtomicU32 = AtomicU32::new(4);
+/// board-frame height of the deck above the Skate root (metres), debug-tunable
+pub static DECK_LIFT: AtomicU32 = AtomicU32::new(0x3DA3D70A); // 0.08
+pub static NO_BOUNDARY: AtomicU32 = AtomicU32::new(1);
+pub static DBG_BOARD: Mutex<String> = Mutex::new(String::new());
 pub static DEBUG_MARKER: AtomicU32 = AtomicU32::new(0);
 
 pub static DEV_PROJ: Mutex<[f32; 16]> = Mutex::new([0.0; 16]);
@@ -82,6 +86,7 @@ unsafe extern "system" fn set_vsc(dev: usize, state: u32, data: *const f32) -> H
         if kind == 2
             && LAST_KIND.load(Ordering::Relaxed) == 1
             && PERSP_DRAWS.load(Ordering::Relaxed) >= 50
+            && NO_BOUNDARY.load(Ordering::Relaxed) == 0
             && DRAWN_FRAME.swap(1, Ordering::Relaxed) == 0
         {
             if VIEWLOG_ARM.load(Ordering::Relaxed) != 0 {
@@ -384,6 +389,12 @@ unsafe fn draw(dev: usize, world_depth: bool) {
         return;
     };
     drop(guard);
+    // the Skate root sits where the wheels touch the ground; the deck is a little above it
+    let lift = f32::from_bits(DECK_LIFT.load(Ordering::Relaxed)) * board.scale;
+    let mut board = board;
+    for i in 0..3 {
+        board.pos[i] += (board.axes[2][i] * lift) as f64;
+    }
     let now = windows_sys::Win32::System::SystemInformation::GetTickCount64();
     if now.saturating_sub(board.at_ms) > 300 {
         DRAW_STAGES[3].fetch_add(1, Ordering::Relaxed);
@@ -416,6 +427,32 @@ unsafe fn draw(dev: usize, world_depth: bool) {
     if DEBUG_MARKER.load(Ordering::Relaxed) != 0 {
         let mark = BoardPose { pos: board.unit, axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], scale: 1.0, unit: board.unit, at_ms: board.at_ms };
         add_box(&mut v, &mark, [0.0, 0.0, 0.0], [0.08, 0.08, 0.08], 0xFF20E020, cpos);
+        if let Ok(l) = crate::skel::LEGS.try_lock() {
+            if let Some((legs, facing)) = *l {
+                let (sn, cs) = facing.sin_cos();
+                for (si, side) in legs.iter().enumerate() {
+                    for (pi, p) in side.iter().enumerate() {
+                        let w = [board.unit[0] + (cs * p[0] - sn * p[1]) as f64, board.unit[1] + (sn * p[0] + cs * p[1]) as f64, board.unit[2] + p[2] as f64];
+                        let m = BoardPose { pos: w, axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], scale: 1.0, unit: w, at_ms: board.at_ms };
+                        // thigh yellow, knee white, ankle red / blue (left / right), toe magenta
+                        let col = match pi { 0 => 0xFFFFFF20, 1 => 0xFFFFFFFF, 2 => if si == 0 { 0xFFFF2020 } else { 0xFF2020FF }, _ => 0xFFFF20FF };
+                        add_box(&mut v, &m, [0.0, 0.0, 0.0], [0.025, 0.025, 0.025], col, cpos);
+                    }
+                }
+            }
+        }
+    }
+    {
+        // debug: where the board centre lands on screen
+        let d = [(board.pos[0] - cpos[0]) as f32, (board.pos[1] - cpos[1]) as f32, (board.pos[2] - cpos[2]) as f32];
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let vz = dot(d, axes[0]);
+        let vx = -dot(d, axes[1]);
+        let vy = dot(d, axes[2]);
+        let xs0 = 1.0 / (fov * 0.5).tan();
+        if let Ok(mut l) = DBG_BOARD.try_lock() {
+            *l = format!("cpos {:.2?} board {:.2?} view-space ({:.2},{:.2},{:.2}) ndc ({:.2},{:.2}) fov {:.3} aspect {:.3} near {:.2}", cpos, board.pos, vx, vy, vz, xs0 * vx / vz, xs0 * aspect * vy / vz, fov, aspect, near);
+        }
     }
     // view (camera-relative: rotation only) and projection, D3D left-handed row-vector layout
     let (f, l, u) = (axes[0], axes[1], axes[2]);
@@ -595,6 +632,23 @@ pub unsafe fn install() -> bool {
     VirtualProtect(slot as _, 4, old, &mut old);
     SLOT.store(slot as u32, Ordering::SeqCst);
     true
+}
+
+/// The client can recreate its device (graphics restart): the new vtable is unhooked, so hook it again.
+pub unsafe fn recheck() -> bool {
+    let Some(gx) = rd::<u32>(GLOBAL_GX) else { return false };
+    let Some(dev) = rd::<u32>(gx as usize + GX_DEVICE) else { return false };
+    if dev == 0 {
+        return false;
+    }
+    let vt = *(dev as usize as *const usize);
+    if *((vt + VT_END_SCENE * 4) as *const usize) == end_scene as usize {
+        return false;
+    }
+    SLOT.store(0, Ordering::SeqCst);
+    SLOT_VSC.store(0, Ordering::SeqCst);
+    SLOT_DIP.store(0, Ordering::SeqCst);
+    install() && install_vsc()
 }
 
 pub unsafe fn remove() {

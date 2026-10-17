@@ -57,6 +57,11 @@ local SKATE_FPS = "60"
 local savedFps
 
 local function capFps()
+    -- vertical sync: every client frame lands on a display refresh, the Skate engine follows those frames
+    if GetCVar("gxVSync") ~= "1" then
+        SetCVar("gxVSync", "1")
+        RestartGx()
+    end
     if not savedFps then
         savedFps = { GetCVar("maxfps"), GetCVar("maxfpsbk") }
     end
