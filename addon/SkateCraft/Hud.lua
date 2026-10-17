@@ -1,7 +1,7 @@
 -- SkateCraft score HUD: the trick name, the running points and the multiplier while a trick sequence is going,
 -- a "landed" line with the points when it is put down, "bail" when it is not, and the session total.
 -- The numbers come from the Skate engine through the client plugin (SkateCraft_State).
-local FONT = "Fonts\FRIZQT__.TTF"
+local FONT = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
 
 local hud = CreateFrame("Frame", "SkateCraftHud", UIParent)
 hud:SetAllPoints(UIParent)

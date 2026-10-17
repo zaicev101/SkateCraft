@@ -1,10 +1,10 @@
 -- SkateCraft places: teleport to interesting spots (capitals, raid entrances) with a small picture and the name, and
 -- remember / return to your own spot. Needs a game master account on the server (it sends .tele / .go xyz).
 -- Gamepad: L3 + D-pad up = remember this place, down = return to it, right / left = next / previous destination.
-local FONT = "Fonts\\FRIZQT__.TTF"
+local FONT = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
 local ICON = "Interface\\Icons\\"
 local LFG = "Interface\\LFGFrame\\"
-local MAP1, MAP2 = ICON .. "INV_Misc_Map_01", ICON .. "INV_Misc_Map02"
+local MAP1, MAP2 = ICON .. "INV_Misc_Note_01", ICON .. "INV_Misc_Map02"
 
 -- { game_tele name, title, subtitle, texture }
 local PLACES = {
