@@ -27,7 +27,33 @@ pub struct Model {
 }
 
 pub static MODEL: Mutex<Option<Model>> = Mutex::new(None);
-pub static POSE: Mutex<Option<PoseFrame>> = Mutex::new(None);
+/// the two newest guest poses (older, newer): the model shows the pose interpolated between them, one guest frame late
+pub static POSES: Mutex<[Option<PoseFrame>; 2]> = Mutex::new([None, None]);
+/// guest frame interval in microseconds (f64 bits), smoothed by the worker
+pub static POSE_DELAY: AtomicU64 = AtomicU64::new(0x40D0_5C00_0000_0000); // 16700.0
+
+fn blend_pose(a: &PoseFrame, b: &PoseFrame, s: f32) -> PoseFrame {
+    let mut out = *b;
+    let lerp = |x: f32, y: f32| x + (y - x) * s;
+    let n = (b.nparts as usize).min(skatecraft_protocol::POSE_PARTS);
+    for i in 0..n {
+        let (pa, pb) = (&a.parts[i], &b.parts[i]);
+        out.parts[i].pos = [lerp(pa.pos[0], pb.pos[0]), lerp(pa.pos[1], pb.pos[1]), lerp(pa.pos[2], pb.pos[2])];
+        let dot: f32 = (0..4).map(|k| pa.rot[k] * pb.rot[k]).sum();
+        let sg = if dot < 0.0 { -1.0 } else { 1.0 };
+        let mut q = [0f32; 4];
+        for k in 0..4 {
+            q[k] = lerp(pa.rot[k] * sg, pb.rot[k]);
+        }
+        let l = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt().max(1e-6);
+        out.parts[i].rot = [q[0] / l, q[1] / l, q[2] / l, q[3] / l];
+    }
+    let mut d = b.facing - a.facing;
+    while d > core::f32::consts::PI { d -= 2.0 * core::f32::consts::PI; }
+    while d < -core::f32::consts::PI { d += 2.0 * core::f32::consts::PI; }
+    out.facing = a.facing + d * s;
+    out
+}
 pub static POSE_AT: AtomicU64 = AtomicU64::new(0);
 pub static DEBUG: Mutex<String> = Mutex::new(String::new());
 pub static DEBUG2: Mutex<String> = Mutex::new(String::new());
@@ -40,6 +66,9 @@ pub static BAD_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 /// debug switch (`skatecraft_off.txt` containing `bones`): leave the client's own animation alone
 pub static DISABLED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static SKIPS: [core::sync::atomic::AtomicU32; 4] = [const { core::sync::atomic::AtomicU32::new(0) }; 4];
+/// debug: per-apply values for a recording (see `skatecraft_applylog.txt`)
+pub static APPLYLOG: Mutex<Vec<[f32; 10]>> = Mutex::new(Vec::new());
+pub static APPLYLOG_ARM: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub static APPLIED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 const NBONES: usize = 228;
@@ -485,11 +514,22 @@ pub unsafe fn apply(base: usize) {
         SKIPS[0].fetch_add(1, Ordering::Relaxed);
         return; // no fresh pose: leave the client's own animation
     }
-    let (Ok(model), Ok(pose)) = (MODEL.try_lock(), POSE.try_lock()) else {
+    let (Ok(model), Ok(poses)) = (MODEL.try_lock(), POSES.try_lock()) else {
         SKIPS[1].fetch_add(1, Ordering::Relaxed);
         return;
     };
-    let (Some(model), Some(pose)) = (model.as_ref(), pose.as_ref()) else { return };
+    let Some(model) = model.as_ref() else { return };
+    let Some(newer) = poses[1].as_ref() else { return };
+    let pose_blended;
+    let pose: &PoseFrame = match poses[0].as_ref() {
+        Some(older) if newer.t_us > older.t_us => {
+            let tr = skatecraft_protocol::now_us() as f64 - f64::from_bits(POSE_DELAY.load(Ordering::Relaxed));
+            let sfrac = ((tr - older.t_us as f64) / (newer.t_us - older.t_us) as f64).clamp(0.0, 1.25) as f32;
+            pose_blended = blend_pose(older, newer, sfrac);
+            &pose_blended
+        }
+        _ => newer,
+    };
     let Some(t) = targets(model, pose) else {
         SKIPS[2].fetch_add(1, Ordering::Relaxed);
         return;
@@ -507,15 +547,30 @@ pub unsafe fn apply(base: usize) {
     let mut t = t;
     let mut b_new = forward(model, &t, &b_client);
     // stand on the board: the ankles must be as high as the Skate skater's (board included)
-    let side = if t.ankle_z[0] <= t.ankle_z[1] { 0 } else { 1 };
-    let ankle_now = point(model.pivot[FOOT[side][0]], &b_new[FOOT[side][0]])[2];
-    let err = (t.ankle_z[side] - ankle_now).clamp(-0.6, 0.6);
+    // both feet count, weighted towards the lower one smoothly (picking one foot by comparison flipped every frame)
+    let ankle_now = [
+        point(model.pivot[FOOT[0][0]], &b_new[FOOT[0][0]])[2],
+        point(model.pivot[FOOT[1][0]], &b_new[FOOT[1][0]])[2],
+    ];
+    let w1 = ((t.ankle_z[0] - t.ankle_z[1] + 0.08) / 0.16).clamp(0.0, 1.0); // weight of the left foot
+    let w1 = w1 * w1 * (3.0 - 2.0 * w1);
+    let e0 = t.ankle_z[0] - ankle_now[0];
+    let e1 = t.ankle_z[1] - ankle_now[1];
+    let err = (e0 * (1.0 - w1) + e1 * w1).clamp(-0.6, 0.6);
     if let Ok(mut d) = DEBUG2.try_lock() {
-        *d = format!("ankle match: side {side} target {:.3} now {:.3} err {:.3} pelvis_z {:.3}", t.ankle_z[side], ankle_now, err, t.joint_pelvis[2]);
+        *d = format!("ankle match: targets {:.3}/{:.3} now {:.3}/{:.3} err {:.3} pelvis_z {:.3}", t.ankle_z[0], t.ankle_z[1], ankle_now[0], ankle_now[1], err, t.joint_pelvis[2]);
     }
     if err.is_finite() && err.abs() > 0.003 {
         t.joint_pelvis[2] += err;
         b_new = forward(model, &t, &b_client);
+    }
+    if APPLYLOG_ARM.load(Ordering::Relaxed) != 0 {
+        if let Ok(mut l) = APPLYLOG.try_lock() {
+            if l.len() < 20000 {
+                let age = now.saturating_sub(POSE_AT.load(Ordering::Relaxed)) as f32;
+                l.push([(now % 1_000_000) as f32, t.joint_pelvis[2], err, ankle_now[0], ankle_now[1], t.ankle_z[0], t.ankle_z[1], age, pose.frame as f32, pose.facing]);
+            }
+        }
     }
     if let Ok(mut l) = LEGS.try_lock() {
         let j = |b: usize| point(model.pivot[b], &b_new[b]);

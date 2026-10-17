@@ -15,7 +15,7 @@ pub static REQUEST: Mutex<Option<(u32, f64, f64)>> = Mutex::new(None);
 const RADIUS: f32 = 40.0;
 const STEP: f32 = 2.0;
 
-pub fn build(dir: &str, map: u32, cx: f32, cy: f32) -> Vec<[f32; 9]> {
+pub fn build(dir: &str, map: u32, cx: f32, cy: f32) -> (Vec<[f32; 9]>, u32) {
     let mut out: Vec<[f32; 9]> = Vec::new();
     // terrain: the heightmap sampled on a coarse grid
     let n = (2.0 * RADIUS / STEP) as usize + 1;
@@ -35,9 +35,10 @@ pub fn build(dir: &str, map: u32, cx: f32, cy: f32) -> Vec<[f32; 9]> {
             }
         }
     }
+    let terrain = out.len() as u32;
     // buildings and objects
     crate::vmap::collect(dir, map, cx, cy, RADIUS, PATCH_MAX_TRIS, &mut out);
-    out
+    (out, terrain)
 }
 
 pub fn spawn_builder(dir: String) {
@@ -54,9 +55,9 @@ pub fn spawn_builder(dir: String) {
             if let Some((map, x, y)) = want {
                 if done != Some((map, x, y)) {
                     let t = std::time::Instant::now();
-                    let tris = build(&dir, map, x as f32, y as f32);
+                    let (tris, terrain) = build(&dir, map, x as f32, y as f32);
                     serial = serial.wrapping_add(1).max(1);
-                    shared.write_patch(map, x, y, serial, &tris);
+                    shared.write_patch(map, x, y, serial, terrain, &tris);
                     crate::log(&format!("patch #{serial}: map {map} at ({x:.1}, {y:.1}), {} triangles, {} ms", tris.len(), t.elapsed().as_millis()));
                     done = Some((map, x, y));
                 }

@@ -23,6 +23,8 @@ pub const OFF_GUEST_STATE: usize = 0x200;
 /// The terrain/buildings patch the host cuts out of WoW's collision data around the player.
 pub const OFF_PATCH: usize = 0x1000;
 pub const PATCH_MAX_TRIS: usize = 24000;
+/// bytes of `PatchHeader` before the triangles
+pub const PATCH_HDR: usize = 40;
 /// The skater's pose (guest -> host), for the host to retarget onto the WoW character's bones.
 pub const OFF_POSE: usize = 0xD4000;
 /// The Skate camera, in WoW coordinates, for the host to drive the client's camera with.
@@ -118,6 +120,9 @@ pub struct PatchHeader {
     pub serial: u32,
     pub cx: f64,
     pub cy: f64,
+    /// the first `terrain_tris` triangles are terrain, the rest buildings and objects
+    pub terrain_tris: u32,
+    pub pad: u32,
 }
 
 /// One body of the skater: position relative to the skater's root, world-aligned WoW axes
@@ -147,6 +152,8 @@ pub struct PoseFrame {
     pub pad: u32,
     pub facing: f32,
     pub speed: f32,
+    /// when the sample was taken (`now_us`)
+    pub t_us: u64,
     pub parts: [PoseBody; POSE_PARTS],
     pub board: [PoseBody; POSE_BOARD],
 }
@@ -162,6 +169,7 @@ impl Default for PoseFrame {
             pad: 0,
             facing: 0.0,
             speed: 0.0,
+            t_us: 0,
             parts: [PoseBody::default(); POSE_PARTS],
             board: [PoseBody::default(); POSE_BOARD],
         }
@@ -188,8 +196,9 @@ pub struct CamFrame {
 
 const _: () = assert!(OFF_POSE + core::mem::size_of::<PoseFrame>() <= OFF_CAM);
 const _: () = assert!(OFF_CAM + core::mem::size_of::<CamFrame>() <= MAPPING_BYTES);
-const _: () = assert!(OFF_PATCH + 32 + PATCH_MAX_TRIS * 36 <= OFF_POSE);
-const _: () = assert!(OFF_PATCH + 32 + PATCH_MAX_TRIS * 36 <= MAPPING_BYTES);
+const _: () = assert!(core::mem::size_of::<PatchHeader>() == PATCH_HDR);
+const _: () = assert!(OFF_PATCH + PATCH_HDR + PATCH_MAX_TRIS * 36 <= OFF_POSE);
+const _: () = assert!(OFF_PATCH + PATCH_HDR + PATCH_MAX_TRIS * 36 <= MAPPING_BYTES);
 const _: () = assert!(core::mem::size_of::<Header>() <= 0x100);
 const _: () = assert!(core::mem::size_of::<WowState>() <= 0x100);
 const _: () = assert!(core::mem::size_of::<GuestState>() <= 0x100);
@@ -235,7 +244,7 @@ impl Shared {
             let h = s.header_ptr();
             if (*h).magic != MAGIC {
                 ptr::write_bytes(s.base, 0, 0x300);
-                ptr::write_bytes(s.base.add(OFF_PATCH), 0, 32);
+                ptr::write_bytes(s.base.add(OFF_PATCH), 0, PATCH_HDR);
                 (*h).magic = MAGIC;
                 (*h).version = VERSION;
             }
@@ -313,7 +322,7 @@ impl Shared {
     }
 
     /// Publish a new patch (single writer: the host).
-    pub fn write_patch(&self, map_id: u32, cx: f64, cy: f64, serial: u32, tris: &[[f32; 9]]) {
+    pub fn write_patch(&self, map_id: u32, cx: f64, cy: f64, serial: u32, terrain_tris: u32, tris: &[[f32; 9]]) {
         let n = tris.len().min(PATCH_MAX_TRIS);
         unsafe {
             let p = self.base.add(OFF_PATCH) as *mut PatchHeader;
@@ -326,7 +335,8 @@ impl Shared {
             ptr::write_volatile(ptr::addr_of_mut!((*p).serial), serial);
             ptr::write_volatile(ptr::addr_of_mut!((*p).cx), cx);
             ptr::write_volatile(ptr::addr_of_mut!((*p).cy), cy);
-            ptr::copy_nonoverlapping(tris.as_ptr() as *const u8, self.base.add(OFF_PATCH + 32), n * 36);
+            ptr::write_volatile(ptr::addr_of_mut!((*p).terrain_tris), terrain_tris);
+            ptr::copy_nonoverlapping(tris.as_ptr() as *const u8, self.base.add(OFF_PATCH + PATCH_HDR), n * 36);
             fence(Ordering::Release);
             seq.store(s.wrapping_add(2), Ordering::Release);
         }
@@ -351,7 +361,7 @@ impl Shared {
                 let h = ptr::read_volatile(p);
                 let n = (h.count as usize).min(PATCH_MAX_TRIS);
                 let mut v: Vec<[f32; 9]> = Vec::with_capacity(n);
-                ptr::copy_nonoverlapping(self.base.add(OFF_PATCH + 32), v.as_mut_ptr() as *mut u8, n * 36);
+                ptr::copy_nonoverlapping(self.base.add(OFF_PATCH + PATCH_HDR), v.as_mut_ptr() as *mut u8, n * 36);
                 v.set_len(n);
                 fence(Ordering::Acquire);
                 if seq.load(Ordering::Acquire) == a {

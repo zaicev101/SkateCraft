@@ -148,6 +148,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
     let mut zf_checked = 0u64;
     let mut camlog_until: Option<Instant> = None;
     let mut viewlog_until: Option<Instant> = None;
+    let mut applylog_until: Option<Instant> = None;
     let (mut last_cam_t, mut last_cam_ms) = (0u64, 0u64);
     let (mut cam_s0, mut cam_s1) = (camhook::CamSample::default(), camhook::CamSample::default());
     let mut cam_delay = 16_700.0f64;
@@ -299,6 +300,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             if let Ok(d) = skel::DEBUG.try_lock() { if !d.is_empty() { log(&format!("retarget: {}", *d)); } }
             { let f = board::FRAMES.load(Ordering::Relaxed); log(&format!("fps {}", f.wrapping_sub(last_frames))); last_frames = f; }
             log(&format!("retarget skips: stale pose {}, locked {}, no targets {}, bad array {}", skel::SKIPS[0].load(Ordering::Relaxed), skel::SKIPS[1].load(Ordering::Relaxed), skel::SKIPS[2].load(Ordering::Relaxed), skel::SKIPS[3].load(Ordering::Relaxed)));
+            log(&format!("board draw stages: called {}, disabled {}, no pose {}, stale {}, no camera {}, state block failed {}, drawn {}", board::DRAW_STAGES[0].load(Ordering::Relaxed), board::DRAW_STAGES[1].load(Ordering::Relaxed), board::DRAW_STAGES[2].load(Ordering::Relaxed), board::DRAW_STAGES[3].load(Ordering::Relaxed), board::DRAW_STAGES[4].load(Ordering::Relaxed), board::DRAW_STAGES[5].load(Ordering::Relaxed), board::DRAW_STAGES[6].load(Ordering::Relaxed)));
             log(&format!("retarget safety: {} bad matrices, last bone {}", skel::BAD_COUNT.load(Ordering::Relaxed), skel::BAD_BONE.load(Ordering::Relaxed) as i32 - 1));
             if let Ok(d) = skel::DEBUG2.try_lock() { if !d.is_empty() { log(&format!("{}", *d)); } }
             if let (Ok(p), Ok(v)) = (board::DEV_PROJ.try_lock(), board::DEV_VIEW.try_lock()) { log(&format!("device proj {:.4?} view {:.3?}", *p, *v)); }
@@ -453,7 +455,20 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                     unit: [acc.0, acc.1, acc.2],
                     at_ms: now,
                 });
-                *skel::POSE.lock().unwrap() = Some(ps);
+                {
+                    let mut g = skel::POSES.lock().unwrap();
+                    if g[1].map_or(true, |p| p.t_us != ps.t_us) {
+                        if let Some(prev) = g[1] {
+                            let iv = ps.t_us.saturating_sub(prev.t_us) as f64;
+                            if iv > 2000.0 && iv < 100_000.0 {
+                                let old = f64::from_bits(skel::POSE_DELAY.load(Ordering::Relaxed));
+                                skel::POSE_DELAY.store((0.85 * old + 0.15 * iv).to_bits(), Ordering::Relaxed);
+                            }
+                        }
+                        g[0] = g[1].or(Some(ps));
+                        g[1] = Some(ps);
+                    }
+                }
                 skel::POSE_AT.store(now, Ordering::Relaxed);
             }
         }
@@ -488,6 +503,27 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
                 .map(|t| t.split(',').filter_map(|x| x.trim().parse().ok()).collect())
                 .unwrap_or_default();
             *skel::EXTRA_PIN.lock().unwrap() = v;
+        }
+        if applylog_until.is_some() && Instant::now() >= applylog_until.unwrap() {
+            applylog_until = None;
+            skel::APPLYLOG_ARM.store(0, Ordering::Relaxed);
+            let rows = skel::APPLYLOG.lock().unwrap().clone();
+            let mut csv = String::from("t_ms,pelvis_z,err,ankle0_now,ankle1_now,ankle0_target,ankle1_target,pose_age_ms,pose_frame,facing
+");
+            for r in &rows {
+                csv += &r.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
+                csv += "
+";
+            }
+            let _ = std::fs::write(format!(r"{}\skatecraft_apply.csv", GAME_DIR.lock().unwrap()), csv);
+            log(&format!("apply log: {} rows written", rows.len()));
+            skel::APPLYLOG.lock().unwrap().clear();
+        }
+        if applylog_until.is_none() && std::path::Path::new(&format!(r"{}\skatecraft_applylog.txt", GAME_DIR.lock().unwrap())).exists() {
+            let _ = std::fs::remove_file(format!(r"{}\skatecraft_applylog.txt", GAME_DIR.lock().unwrap()));
+            skel::APPLYLOG.lock().unwrap().clear();
+            skel::APPLYLOG_ARM.store(1, Ordering::Relaxed);
+            applylog_until = Some(Instant::now() + std::time::Duration::from_secs(40));
         }
         if viewlog_until.is_some() && Instant::now() >= viewlog_until.unwrap() {
             viewlog_until = None;
@@ -528,7 +564,7 @@ unsafe extern "system" fn worker(_: *mut c_void) -> u32 {
             let _ = std::fs::remove_file(format!(r"{}\skatecraft_camlog.txt", GAME_DIR.lock().unwrap()));
             board::CAMLOG.lock().unwrap().clear();
             board::CAMLOG_ARM.store(1, Ordering::Relaxed);
-            camlog_until = Some(Instant::now() + std::time::Duration::from_millis(4000));
+            camlog_until = Some(Instant::now() + std::time::Duration::from_millis(40000));
         }
         if vsc_until.is_some() && Instant::now() >= vsc_until.unwrap() {
             vsc_until = None;

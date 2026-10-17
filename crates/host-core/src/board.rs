@@ -28,6 +28,8 @@ pub static DEPTH_TEST: AtomicU32 = AtomicU32::new(1);
 pub const BOARD_LIGHT: u32 = 0xFF8A8A92;
 /// debug switch (`skatecraft_off.txt` containing `board`): do not draw the board
 pub static DISABLED: AtomicU32 = AtomicU32::new(0);
+/// debug: why `draw` ended (0 called, 1 disabled, 2 no board pose, 3 stale pose, 4 no camera, 5 state block failed, 6 drawn)
+pub static DRAW_STAGES: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
 /// EndScene calls (= frames), for the fps readout
 pub static FRAMES: AtomicU32 = AtomicU32::new(0);
 pub static ZFUNC: AtomicU32 = AtomicU32::new(4);
@@ -368,20 +370,32 @@ unsafe fn deck_texture(dev: usize) -> usize {
 }
 
 unsafe fn draw(dev: usize, world_depth: bool) {
+    DRAW_STAGES[0].fetch_add(1, Ordering::Relaxed);
     if DISABLED.load(Ordering::Relaxed) != 0 {
+        DRAW_STAGES[1].fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let Ok(guard) = BOARD.try_lock() else { return };
-    let Some(board) = *guard else { return };
+    let Ok(guard) = BOARD.try_lock() else {
+        DRAW_STAGES[2].fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let Some(board) = *guard else {
+        DRAW_STAGES[2].fetch_add(1, Ordering::Relaxed);
+        return;
+    };
     drop(guard);
     let now = windows_sys::Win32::System::SystemInformation::GetTickCount64();
     if now.saturating_sub(board.at_ms) > 300 {
+        DRAW_STAGES[3].fetch_add(1, Ordering::Relaxed);
         return;
     }
-    let Some((cpos, axes, near, far, fov, aspect)) = camera() else { return };
+    let Some((cpos, axes, near, far, fov, aspect)) = camera() else {
+        DRAW_STAGES[4].fetch_add(1, Ordering::Relaxed);
+        return;
+    };
     if CAMLOG_ARM.load(Ordering::Relaxed) != 0 {
         if let Ok(mut l) = CAMLOG.try_lock() {
-            if l.len() < 600 {
+            if l.len() < 12000 {
                 l.push([now as f64, cpos[0], cpos[1], cpos[2], board.unit[0], board.unit[1], board.unit[2], axes[0][2] as f64]);
             }
         }
@@ -461,6 +475,7 @@ unsafe fn draw(dev: usize, world_depth: bool) {
     let mut sb: usize = 0;
     let create: unsafe extern "system" fn(usize, u32, *mut usize) -> Hr = core::mem::transmute(vtbl(dev, VT_CREATE_STATE_BLOCK));
     if create(dev, 1, &mut sb) < 0 || sb == 0 {
+        DRAW_STAGES[5].fetch_add(1, Ordering::Relaxed);
         return;
     }
 
@@ -534,6 +549,7 @@ unsafe fn draw(dev: usize, world_depth: bool) {
     let release: unsafe extern "system" fn(usize) -> u32 = core::mem::transmute(vtbl(sb, 2));
     release(sb);
     DRAWN.fetch_add(1, Ordering::Relaxed);
+    DRAW_STAGES[6].fetch_add(1, Ordering::Relaxed);
 }
 
 unsafe extern "system" fn end_scene(dev: usize) -> Hr {
