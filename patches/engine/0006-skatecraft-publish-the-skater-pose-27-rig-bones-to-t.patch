@@ -1,0 +1,125 @@
+From 2c1cb90ede42ecf5e328d476cb88f700eee7751b Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Sat, 17 Oct 2026 00:40:30 +0300
+Subject: [PATCH 06/15] skatecraft: publish the skater pose (27 rig bones) to
+ the host
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/wowbridge.rs | 67 +++++++++++++++++++++++++++++-
+ 1 file changed, 65 insertions(+), 2 deletions(-)
+
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index 4297726..a55c8ef 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -16,7 +16,7 @@
+ 
+ use bevy::prelude::*;
+ use skate_core::math::Vector3;
+-use skatecraft_protocol::{guest_flags, wow_flags, GuestState, Shared};
++use skatecraft_protocol::{guest_flags, wow_flags, GuestState, PoseBody, PoseFrame, Shared, POSE_PARTS};
+ 
+ pub struct WowBridgePlugin;
+ 
+@@ -29,7 +29,7 @@ impl Plugin for WowBridgePlugin {
+             Ok(shared) => {
+                 info!("SkateCraft bridge: shared region ready (F8 toggles driving)");
+                 let driving = std::env::var("SKATECRAFT_DRIVE").as_deref() == Ok("1");
+-                app.insert_resource(Bridge { shared, origin: None, rest_y: None, driving, frame: 0, seen_serial: 0, world_serial: 0 });
++                app.insert_resource(Bridge { shared, origin: None, rest_y: None, driving, frame: 0, names_logged: false, pose_slots: Vec::new(), seen_serial: 0, world_serial: 0 });
+                 app.add_systems(Update, bridge);
+             }
+             Err(e) => warn!("SkateCraft bridge: could not open the shared region (error {e})"),
+@@ -47,11 +47,37 @@ struct Bridge {
+     driving: bool,
+     frame: u32,
+     /// last patch serial looked at while waiting to anchor
++    names_logged: bool,
++    pose_slots: Vec<Option<usize>>,
+     seen_serial: u32,
+     /// serial of the patch the physics world was built from
+     world_serial: u32,
+ }
+ 
++/// The Skate rig bones published to the host, in slot order (the host's retarget relies on it).
++const POSE_BONES: [&str; 27] = [
++    "HIPS", "SPINE", "SPINE1", "SPINE2", "SPINE3", "NECK", "NECK1", "HEAD",
++    "RIGHTSHOULDER", "RIGHTARM", "RIGHTFOREARM", "RIGHTHAND",
++    "LEFTSHOULDER", "LEFTARM", "LEFTFOREARM", "LEFTHAND",
++    "RIGHTUPLEG", "RIGHTLEG", "RIGHTFOOT", "RIGHTTOEBASE",
++    "LEFTUPLEG", "LEFTLEG", "LEFTFOOT", "LEFTTOEBASE",
++    "SKATEBOARD_ROOT", "TRUCK_FRONT", "TRUCK_BACK",
++];
++
++/// Skate-axis world matrix of a rig bone -> body in WoW axes relative to `root`.
++fn pose_body(m: &[[f32; 4]; 4], root: [f32; 3]) -> PoseBody {
++    let to_wow = |v: [f32; 3]| [v[2], v[0], v[1]]; // WoW (X, Y, Z) = Skate (z, x, y)
++    let pos = to_wow([m[3][0] - root[0], m[3][1] - root[1], m[3][2] - root[2]]);
++    let basis = Mat3::from_cols(
++        Vec3::new(m[0][0], m[0][1], m[0][2]).normalize_or_zero(),
++        Vec3::new(m[1][0], m[1][1], m[1][2]).normalize_or_zero(),
++        Vec3::new(m[2][0], m[2][1], m[2][2]).normalize_or_zero(),
++    );
++    let q = Quat::from_mat3(&basis).normalize();
++    // the same cyclic axis permutation applies to the rotation axis
++    PoseBody { pos, rot: [q.z, q.x, q.y, q.w] }
++}
++
+ /// WoW triangles -> Skate axes around `origin`, normals of floor-like triangles pointing up.
+ fn skate_triangles(patch: &[[f32; 9]], origin: [f64; 3]) -> Vec<[Vector3; 3]> {
+     let map = |x: f32, y: f32, z: f32| {
+@@ -103,6 +129,13 @@ fn bridge(
+     }
+     let rest_y = b.rest_y.unwrap();
+     let in_world = w.flags & wow_flags::IN_WORLD != 0;
++    if !b.names_logged {
++        b.names_logged = true;
++        let names = &skater.animation.evaluator.frames.bone_names;
++        info!("SkateCraft bridge: skater rig has {} bones: {}", names.len(), names.join(", "));
++        let parts: Vec<String> = skater.animated_skeleton.bone_indices.iter().map(|&i| names.get(i).cloned().unwrap_or_default()).collect();
++        info!("SkateCraft bridge: physics parts: {}", parts.join(", "));
++    }
+ 
+     if b.driving && in_world {
+         // anchor once a patch around the character is available
+@@ -135,6 +168,36 @@ fn bridge(
+         }
+     }
+ 
++    if b.pose_slots.is_empty() {
++        let names = &skater.animation.evaluator.frames.bone_names;
++        b.pose_slots = POSE_BONES.iter().map(|n| names.iter().position(|x| x.eq_ignore_ascii_case(n))).collect();
++    }
++    if b.frame % 60 == 0 {
++        let names = &skater.animation.evaluator.frames.bone_names;
++        let at = |n: &str| names.iter().position(|x| x.eq_ignore_ascii_case(n)).and_then(|i| skater.render_pose.get(i)).map(|m| [m[3][0], m[3][1], m[3][2]]);
++        let a = &skater.animated_skeleton.roots.animation_to_world;
++        info!("SkateCraft pose debug: sp={:?} a2w_x={:?} a2w_y={:?} a2w_z={:?} traj={:?} hips={:?} board={:?} lfoot={:?} wheel={:?}",
++            sp, [a[0][0], a[0][1], a[0][2]], [a[1][0], a[1][1], a[1][2]], [a[2][0], a[2][1], a[2][2]],
++            at("TRAJECTORY"), at("HIPS"), at("SKATEBOARD_ROOT"), at("LEFTFOOT"), at("LEFT_WHEELFRONT"));
++    }
++    if b.driving && in_world && b.origin.is_some() {
++        let mut pose = PoseFrame { frame: b.frame, nparts: POSE_BONES.len().min(POSE_PARTS) as u32, facing: heading, speed: 0.0, ..Default::default() };
++        for (slot, idx) in b.pose_slots.iter().enumerate().take(POSE_PARTS) {
++            if let Some(m) = idx.and_then(|i| skater.render_pose.get(i)) {
++                // render_pose is in animation space; world = pose * animation_to_world (row vectors)
++                let a = &skater.animated_skeleton.roots.animation_to_world;
++                // the 4th column of a native matrix is not homogeneous: rotate the xyz rows, add the root's offset to the position
++                let mut w = [[0.0f32; 4]; 4];
++                for r in 0..4 {
++                    for c in 0..3 {
++                        w[r][c] = (0..3).map(|k| m[r][k] * a[k][c]).sum::<f32>() + if r == 3 { a[3][c] } else { 0.0 };
++                    }
++                }
++                pose.parts[slot] = pose_body(&w, sp);
++            }
++        }
++        b.shared.write_pose(pose);
++    }
+     let mut out = GuestState { flags: guest_flags::ALIVE, ..Default::default() };
+     if b.driving && in_world {
+         if let Some(o) = b.origin {
+-- 
+2.50.1.windows.1
+

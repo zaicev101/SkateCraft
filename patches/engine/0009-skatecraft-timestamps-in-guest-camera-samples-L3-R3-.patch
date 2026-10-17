@@ -1,0 +1,133 @@
+From 97be3622868d54689ad0214a644aadd63a7cd954 Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Sat, 17 Oct 2026 02:12:12 +0300
+Subject: [PATCH 09/15] skatecraft: timestamps in guest/camera samples, L3+R3
+ presets
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/wowbridge.rs | 65 +++++++++++++++++++++---------
+ 1 file changed, 46 insertions(+), 19 deletions(-)
+
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index d534733..9e475b7 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -18,23 +18,31 @@ use bevy::prelude::*;
+ use skate_core::math::Vector3;
+ use skatecraft_protocol::{guest_flags, wow_flags, CamFrame, GuestState, PoseBody, PoseFrame, Shared, POSE_PARTS};
+ 
+-/// The player-controlled camera offset (L3 + R3 on the pad toggles it): yaw, pitch, distance multiplier.
++/// The player-controlled camera offset: yaw, pitch, distance multiplier, plus the L3 + R3 combo state.
+ #[derive(Clone, Copy)]
+ struct Orbit {
+     detached: bool,
+     yaw: f32,
+     pitch: f32,
+     mult: f32,
++    preset: usize,
+     combo: bool,
++    press: Option<std::time::Instant>,
++    long_fired: bool,
+     last: Option<std::time::Instant>,
+ }
+ 
+-static ORBIT: std::sync::Mutex<Orbit> = std::sync::Mutex::new(Orbit { detached: false, yaw: 0.0, pitch: 0.0, mult: 1.0, combo: false, last: None });
++/// Camera distance presets cycled by tapping L3 + R3.
++const PRESETS: [f32; 4] = [1.0, 1.7, 2.6, 0.7];
++
++static ORBIT: std::sync::Mutex<Orbit> = std::sync::Mutex::new(Orbit {
++    detached: false, yaw: 0.0, pitch: 0.0, mult: 1.0, preset: 0, combo: false, press: None, long_fired: false, last: None,
++});
+ static DRIVING_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+ 
+-/// Gameplay action values (ids 64..81, see `skate_core::input::gameplay_map`): L3 + R3 together toggles the detached
+-/// camera; while detached, the right stick orbits the skater, LB/RB change the distance, and the right-stick / bumper
+-/// inputs are withheld from the game (so orbiting never throws a trick).
++/// Gameplay action values (ids 64..81, see `skate_core::input::gameplay_map`). Tapping L3 + R3 together cycles the
++/// camera distance presets; holding them for 0.8 s toggles a detached camera, where the right stick orbits the skater
++/// and LB/RB change the distance. The pressed inputs are withheld from the game (no accidental tricks).
+ pub(crate) fn filter_input(values: &mut [f32; 18]) {
+     if !DRIVING_NOW.load(std::sync::atomic::Ordering::Relaxed) {
+         return;
+@@ -45,24 +53,40 @@ pub(crate) fn filter_input(values: &mut [f32; 18]) {
+     o.last = Some(now);
+     let combo = values[66 - 64] > 0.5 && values[69 - 64] > 0.5;
+     if combo && !o.combo {
+-        o.detached = !o.detached;
+-        if !o.detached {
+-            o.yaw = 0.0;
+-            o.pitch = 0.0;
+-            o.mult = 1.0;
++        o.press = Some(now);
++        o.long_fired = false;
++    } else if combo {
++        if let Some(t) = o.press {
++            if !o.long_fired && now.duration_since(t).as_secs_f32() > 0.8 {
++                o.long_fired = true;
++                o.detached = !o.detached;
++                if !o.detached {
++                    o.yaw = 0.0;
++                    o.pitch = 0.0;
++                }
++            }
+         }
++    } else if o.combo && !combo {
++        // released: a short tap cycles the distance preset
++        if !o.long_fired {
++            o.preset = (o.preset + 1) % PRESETS.len();
++            o.mult = PRESETS[o.preset];
++        }
++        o.press = None;
+     }
+     o.combo = combo;
+     if o.detached || combo {
+-        let (rx, ry) = (values[67 - 64], values[68 - 64]);
+-        let dead = |v: f32| if v.abs() < 0.15 { 0.0 } else { v };
+-        o.yaw -= dead(rx) * dt * 2.2;
+-        o.pitch += dead(ry) * dt * 1.6;
+-        o.pitch = o.pitch.clamp(-1.2, 1.2);
+-        o.yaw = o.yaw.clamp(-3.2, 3.2);
+-        if values[73 - 64] > 0.5 { o.mult *= (-dt * 1.2).exp(); }
+-        if values[72 - 64] > 0.5 { o.mult *= (dt * 1.2).exp(); }
+-        o.mult = o.mult.clamp(0.25, 4.0);
++        if o.detached {
++            let (rx, ry) = (values[67 - 64], values[68 - 64]);
++            let dead = |v: f32| if v.abs() < 0.15 { 0.0 } else { v };
++            o.yaw -= dead(rx) * dt * 2.2;
++            o.pitch += dead(ry) * dt * 1.6;
++            o.pitch = o.pitch.clamp(-1.2, 1.2);
++            o.yaw = o.yaw.clamp(-3.2, 3.2);
++            if values[73 - 64] > 0.5 { o.mult *= (-dt * 1.2).exp(); }
++            if values[72 - 64] > 0.5 { o.mult *= (dt * 1.2).exp(); }
++            o.mult = o.mult.clamp(0.25, 4.0);
++        }
+         for id in [66, 67, 68, 69, 72, 73] {
+             values[id - 64] = 0.0;
+         }
+@@ -162,6 +186,7 @@ fn bridge(
+     cameras: Query<(&Transform, &Projection), With<crate::camera::GameplayCamera>>,
+ ) {
+     b.shared.set_guest_beat(skatecraft_protocol::process_id(), skatecraft_protocol::tick_ms());
++    let t_us = skatecraft_protocol::now_us();
+     let w = b.shared.read_wow();
+     // skate mode is switched from inside WoW (the SkateCraft addon); F8 only forces it for tests
+     let forced = std::env::var("SKATECRAFT_DRIVE").as_deref() == Ok("1");
+@@ -279,6 +304,7 @@ fn bridge(
+                 left: [-right[0], -right[1], -right[2]],
+                 up: wow(*tf.up()),
+                 fov_v,
++                t_us,
+                 ..Default::default()
+             });
+         }
+@@ -295,5 +321,6 @@ fn bridge(
+     }
+     b.frame = b.frame.wrapping_add(1);
+     out.frame = b.frame;
++    out.t_us = t_us;
+     b.shared.write_guest(out);
+ }
+-- 
+2.50.1.windows.1
+

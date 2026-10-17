@@ -1,0 +1,32 @@
+From f73e750384dc09bbe84f32a6e0cf4b51e07654e4 Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Sat, 17 Oct 2026 19:21:25 +0300
+Subject: [PATCH 15/15] bridge: guest frame per WoW frame, no minimum period
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/graphics_menu.rs | 7 ++-----
+ 1 file changed, 2 insertions(+), 5 deletions(-)
+
+diff --git a/crates/skate-game/src/graphics_menu.rs b/crates/skate-game/src/graphics_menu.rs
+index bcb918b..8a91425 100644
+--- a/crates/skate-game/src/graphics_menu.rs
++++ b/crates/skate-game/src/graphics_menu.rs
+@@ -1003,12 +1003,9 @@ fn pace(menu: Option<Res<Menu>>, mut pacer: ResMut<FramePacer>) {
+         return;
+     };
+     if crate::wowbridge::bridge_mode() {
+-        // lockstep with the WoW client: one guest frame per presented WoW frame (30 ms fallback when WoW is not drawing)
+-        let min = Duration::from_millis(14);
++        // lockstep with the WoW client: exactly one guest frame per presented WoW frame (30 ms fallback when WoW is not
++        // drawing); a different cadence makes the host interpolate unevenly, which shows as blinking
+         skatecraft_protocol::frame_wait(30);
+-        if let Some(wait) = min.checked_sub(pacer.0.elapsed()) {
+-            std::thread::sleep(wait);
+-        }
+         pacer.0 = Instant::now();
+         return;
+     }
+-- 
+2.50.1.windows.1
+

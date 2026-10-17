@@ -1,0 +1,54 @@
+From 39f08e6cab560288efae67963de829c4f4a294fb Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Sat, 17 Oct 2026 11:56:37 +0300
+Subject: [PATCH 11/15] skatecraft: bridge mode caps the guest at 60 fps and
+ 25% render scale; pad orbit pitch direction
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/graphics_menu.rs | 8 +++++++-
+ crates/skate-game/src/wowbridge.rs     | 2 +-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/crates/skate-game/src/graphics_menu.rs b/crates/skate-game/src/graphics_menu.rs
+index 7abab37..61e767c 100644
+--- a/crates/skate-game/src/graphics_menu.rs
++++ b/crates/skate-game/src/graphics_menu.rs
+@@ -238,7 +238,7 @@ fn setup(
+         .parent()
+         .unwrap_or(&config.asset_root)
+         .join("settings/graphics.json");
+-    let settings = match std::fs::read(&path) {
++    let mut settings = match std::fs::read(&path) {
+         Ok(bytes) => serde_json::from_slice::<GraphicsSettings>(&bytes).unwrap_or_else(|e| {
+             warn!("Graphics settings: {e}");
+             GraphicsSettings::default()
+@@ -246,6 +246,12 @@ fn setup(
+         Err(_) => GraphicsSettings::default(),
+     }
+     .validated();
++    if std::env::var("SKATECRAFT_BRIDGE").as_deref() == Ok("1") {
++        // WoW's client does the drawing: this window only has to run the simulation. Rendering it at full speed and
++        // size competed with WoW for the GPU and broke WoW's frame pacing (stutter / flicker while moving).
++        settings.fps = 60;
++        settings.scale = 25;
++    }
+     window
+         .resolution
+         .set_physical_resolution(settings.width, settings.height);
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index b32bd2b..b75d533 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -306,7 +306,7 @@ fn bridge(
+                 v = Quat::from_rotation_y(orb.yaw) * v;
+                 let side = Vec3::new(-v.z, 0.0, v.x).normalize_or_zero();
+                 if side != Vec3::ZERO {
+-                    v = Quat::from_axis_angle(side, -orb.pitch) * v;
++                    v = Quat::from_axis_angle(side, orb.pitch) * v; // positive pitch raises the camera
+                 }
+                 tf.translation = target + v * orb.mult;
+                 tf = tf.looking_at(target, Vec3::Y);
+-- 
+2.50.1.windows.1
+

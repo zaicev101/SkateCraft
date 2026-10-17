@@ -1,0 +1,190 @@
+From 4f2b2f6769d280f70bd0abe8bf4115cd90ed904b Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Sat, 17 Oct 2026 13:00:57 +0300
+Subject: [PATCH 14/15] bridge: score HUD snapshot + pad requests (L3 + D-pad)
+ published to the host
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/modding/mod.rs         |  1 +
+ crates/skate-game/src/modding/observation.rs | 35 ++++++++
+ crates/skate-game/src/wowbridge.rs           | 86 +++++++++++++++++++-
+ 3 files changed, 120 insertions(+), 2 deletions(-)
+
+diff --git a/crates/skate-game/src/modding/mod.rs b/crates/skate-game/src/modding/mod.rs
+index c703abb..587dd0c 100644
+--- a/crates/skate-game/src/modding/mod.rs
++++ b/crates/skate-game/src/modding/mod.rs
+@@ -11,6 +11,7 @@ pub(crate) mod attachment;
+ mod glb;
+ mod menu;
+ mod observation;
++pub(crate) use observation::{hud_snapshot, HudSnapshot};
+ mod engine_access;
+ mod participation;
+ mod camera_stream;
+diff --git a/crates/skate-game/src/modding/observation.rs b/crates/skate-game/src/modding/observation.rs
+index 743ac1e..0b86c27 100644
+--- a/crates/skate-game/src/modding/observation.rs
++++ b/crates/skate-game/src/modding/observation.rs
+@@ -408,3 +408,38 @@ mod tests {
+         assert_eq!(player["mode"], "air");
+     }
+ }
++
++/// What the score HUD of the WoW bridge needs, read straight from the scoring runtime.
++pub(crate) struct HudSnapshot {
++    pub active: bool,
++    pub clean: bool,
++    pub sketchy: bool,
++    pub bailing: bool,
++    pub landed_seq: u32,
++    pub bail_seq: u32,
++    pub sequence_score: f32,
++    pub line_score: f32,
++    pub multiplier: f32,
++    pub line_time: f32,
++    pub trick: String,
++    pub landed: String,
++}
++
++pub(crate) fn hud_snapshot(world: &World) -> HudSnapshot {
++    let s = world.resource::<crate::physics::SkaterRuntime>();
++    let physics = world.resource::<crate::physics::GamePhysics>();
++    HudSnapshot {
++        active: s.scoring.sequence_active(),
++        clean: s.scoring.clean(),
++        sketchy: s.scoring.sketchy(),
++        bailing: physics.board_wiping_out,
++        landed_seq: s.scoring.landing_seq,
++        bail_seq: s.scoring.bail_seq,
++        sequence_score: s.scoring.sequence_score(),
++        line_score: s.scoring.line_score(),
++        multiplier: s.scoring.multiplier(),
++        line_time: s.scoring.line_time(),
++        trick: crate::scoring_hud::display_trick(world, s.scoring.trick_name()),
++        landed: crate::scoring_hud::display_trick(world, &s.scoring.landed_trick),
++    }
++}
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index 7bd70f2..e75a1fc 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -16,7 +16,7 @@
+ 
+ use bevy::prelude::*;
+ use skate_core::math::Vector3;
+-use skatecraft_protocol::{guest_flags, wow_flags, CamFrame, GuestState, PoseBody, PoseFrame, Shared, POSE_PARTS};
++use skatecraft_protocol::{guest_flags, wow_flags, CamFrame, GuestState, HudFrame, PoseBody, PoseFrame, Shared, POSE_PARTS};
+ 
+ /// The player-controlled camera offset: yaw, pitch, distance multiplier, plus the L3 + R3 combo state.
+ #[derive(Clone, Copy)]
+@@ -43,10 +43,34 @@ static DRIVING_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
+ /// Gameplay action values (ids 64..81, see `skate_core::input::gameplay_map`). Tapping L3 + R3 together cycles the
+ /// camera distance presets; holding them for 0.8 s toggles a detached camera, where the right stick orbits the skater
+ /// and LB/RB change the distance. The pressed inputs are withheld from the game (no accidental tricks).
++/// Pad requests for the addon: (counter, kind), see `HudFrame::req_kind`. L3 held + D-pad: up remembers this place,
++/// down returns to it, right / left pick the next / previous teleport destination.
++static REQUEST: std::sync::Mutex<(u32, u32)> = std::sync::Mutex::new((0, 0));
++static DPAD_PREV: std::sync::Mutex<[bool; 4]> = std::sync::Mutex::new([false; 4]);
++
++fn pad_requests(values: &mut [f32; 18]) {
++    let held = values[66 - 64] > 0.5;
++    let ids = [74usize, 75, 77, 76]; // up, down, right, left -> kinds 1..4
++    let Ok(mut prev) = DPAD_PREV.lock() else { return };
++    for (i, id) in ids.iter().enumerate() {
++        let down = values[id - 64] > 0.5;
++        if held && down && !prev[i] {
++            if let Ok(mut r) = REQUEST.lock() {
++                *r = (r.0.wrapping_add(1), i as u32 + 1);
++            }
++        }
++        if held && (down || prev[i]) {
++            values[id - 64] = 0.0; // the pad request is not a game input
++        }
++        prev[i] = down;
++    }
++}
++
+ pub(crate) fn filter_input(values: &mut [f32; 18]) {
+     if !DRIVING_NOW.load(std::sync::atomic::Ordering::Relaxed) {
+         return;
+     }
++    pad_requests(values);
+     let Ok(mut o) = ORBIT.lock() else { return };
+     let now = std::time::Instant::now();
+     let dt = o.last.map_or(0.016, |t| now.duration_since(t).as_secs_f32()).clamp(0.0, 0.1);
+@@ -111,7 +135,8 @@ impl Plugin for WowBridgePlugin {
+                 info!("SkateCraft bridge: shared region ready (F8 toggles driving)");
+                 let driving = std::env::var("SKATECRAFT_DRIVE").as_deref() == Ok("1");
+                 app.insert_resource(Bridge { shared, origin: None, rest_y: None, driving, frame: 0, names_logged: false, pose_slots: Vec::new(), seen_serial: 0, world_serial: 0 });
+-                app.add_systems(Update, bridge);
++                app.insert_resource(HudState::default());
++                app.add_systems(Update, (bridge, bridge_hud).chain());
+             }
+             Err(e) => warn!("SkateCraft bridge: could not open the shared region (error {e})"),
+         }
+@@ -349,3 +374,60 @@ fn bridge(
+     out.t_us = t_us;
+     b.shared.write_guest(out);
+ }
++
++#[derive(Resource, Default)]
++struct HudState {
++    total: f32,
++    landed_seq: u32,
++    peak: f32,
++    landed_points: f32,
++    last_text: String,
++}
++
++/// Publish the score HUD (exclusive system: the scoring runtime and the trick name tables live in the world).
++fn bridge_hud(world: &mut World) {
++    let snap = crate::modding::hud_snapshot(world);
++    let speed = {
++        let s = world.resource::<crate::physics::SkaterRuntime>();
++        let v = s.player_input.physical.skateboard.vector_80.map(f32::from_bits);
++        (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
++    };
++    world.resource_scope(|world, b: Mut<Bridge>| {
++        let mut h = world.resource_mut::<HudState>();
++        if snap.active {
++            h.peak = h.peak.max(snap.sequence_score);
++            if !snap.trick.is_empty() {
++                h.last_text = snap.trick.clone();
++            }
++        }
++        if snap.landed_seq != h.landed_seq {
++            h.landed_seq = snap.landed_seq;
++            h.landed_points = h.peak;
++            h.total += h.peak;
++            h.peak = 0.0;
++        }
++        if snap.bailing {
++            h.peak = 0.0;
++        }
++        let (req_seq, req_kind) = REQUEST.lock().map(|r| *r).unwrap_or((0, 0));
++        let mut f = HudFrame {
++            seq: 0,
++            flags: snap.active as u32 | (snap.clean as u32) << 1 | (snap.sketchy as u32) << 2 | (snap.bailing as u32) << 3,
++            landed_seq: snap.landed_seq,
++            bail_seq: snap.bail_seq,
++            req_seq,
++            req_kind,
++            sequence_score: snap.sequence_score,
++            line_score: snap.line_score,
++            multiplier: snap.multiplier,
++            line_time: snap.line_time,
++            landed_points: h.landed_points,
++            total: h.total,
++            speed,
++            ..HudFrame::default()
++        };
++        HudFrame::set_text(&mut f.trick, &snap.trick);
++        HudFrame::set_text(&mut f.landed, &snap.landed);
++        b.shared.write_hud(f);
++    });
++}
+-- 
+2.50.1.windows.1
+

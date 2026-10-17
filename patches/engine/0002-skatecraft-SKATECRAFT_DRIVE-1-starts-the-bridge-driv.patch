@@ -1,0 +1,28 @@
+From f6fd7b4bb217d10093481eb6e99c68617776926c Mon Sep 17 00:00:00 2001
+From: zaicev101 <zaicev101@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:33:10 +0300
+Subject: [PATCH 02/15] skatecraft: SKATECRAFT_DRIVE=1 starts the bridge
+ driving
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/wowbridge.rs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index 7e9ca1c..f74d798 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -23,7 +23,8 @@ impl Plugin for WowBridgePlugin {
+         match Shared::create() {
+             Ok(shared) => {
+                 info!("SkateCraft bridge: shared region ready (F8 toggles driving)");
+-                app.insert_resource(Bridge { shared, anchor: None, driving: false, frame: 0 });
++                let driving = std::env::var("SKATECRAFT_DRIVE").as_deref() == Ok("1");
++                app.insert_resource(Bridge { shared, anchor: None, driving, frame: 0 });
+                 app.add_systems(Update, bridge);
+             }
+             Err(e) => warn!("SkateCraft bridge: could not open the shared region (error {e})"),
+-- 
+2.50.1.windows.1
+

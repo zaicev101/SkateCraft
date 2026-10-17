@@ -1,0 +1,121 @@
+From fb664da03645e87fe8d2aa11c0a446a56655d6ba Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Sat, 17 Oct 2026 11:39:30 +0300
+Subject: [PATCH 10/15] skatecraft: publish the interpolated presentation state
+ (root, bones, camera) with the render alpha
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/wowbridge.rs | 57 +++++++++++++++++++-----------
+ 1 file changed, 37 insertions(+), 20 deletions(-)
+
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index 9e475b7..b32bd2b 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -184,6 +184,9 @@ fn bridge(
+     mut physics: ResMut<crate::physics::GamePhysics>,
+     keys: Res<ButtonInput<KeyCode>>,
+     cameras: Query<(&Transform, &Projection), With<crate::camera::GameplayCamera>>,
++    history: Res<crate::presentation::Presentation>,
++    replay: Res<crate::replay::Replay>,
++    time: Res<Time<Fixed>>,
+ ) {
+     b.shared.set_guest_beat(skatecraft_protocol::process_id(), skatecraft_protocol::tick_ms());
+     let t_us = skatecraft_protocol::now_us();
+@@ -201,6 +204,16 @@ fn bridge(
+     let root = skater.animated_skeleton.roots.animation_to_world;
+     let sp = [root[3][0], root[3][1], root[3][2]];
+     let heading = root[2][0].atan2(root[2][2]);
++    // what we publish is what the engine renders: the snapshots of the last two fixed ticks, blended with the same
++    // alpha the camera uses (the raw physics state is a tick ahead and made everything shake relative to the camera)
++    let view = history.view(&replay, time.overstep_fraction());
++    let root_i: Transform = match view {
++        Some((a, c, al)) => crate::presentation::blend(a.root, c.root, al),
++        None => Transform::from_matrix(crate::animation::native_matrix(root)),
++    };
++    let sp_i = root_i.translation;
++    let zax = root_i.rotation * Vec3::Z;
++    let heading_i = zax.x.atan2(zax.z);
+     if b.rest_y.is_none() {
+         b.rest_y = Some(sp[1]);
+     }
+@@ -258,19 +271,20 @@ fn bridge(
+             at("TRAJECTORY"), at("HIPS"), at("SKATEBOARD_ROOT"), at("LEFTFOOT"), at("LEFT_WHEELFRONT"));
+     }
+     if b.driving && in_world && b.origin.is_some() {
+-        let mut pose = PoseFrame { frame: b.frame, nparts: POSE_BONES.len().min(POSE_PARTS) as u32, facing: heading, speed: 0.0, ..Default::default() };
++        let mut pose = PoseFrame { frame: b.frame, nparts: POSE_BONES.len().min(POSE_PARTS) as u32, facing: heading_i, speed: 0.0, ..Default::default() };
++        let rootm = root_i.to_matrix();
+         for (slot, idx) in b.pose_slots.iter().enumerate().take(POSE_PARTS) {
+-            if let Some(m) = idx.and_then(|i| skater.render_pose.get(i)) {
+-                // render_pose is in animation space; world = pose * animation_to_world (row vectors)
+-                let a = &skater.animated_skeleton.roots.animation_to_world;
+-                // the 4th column of a native matrix is not homogeneous: rotate the xyz rows, add the root's offset to the position
+-                let mut w = [[0.0f32; 4]; 4];
+-                for r in 0..4 {
+-                    for c in 0..3 {
+-                        w[r][c] = (0..3).map(|k| m[r][k] * a[k][c]).sum::<f32>() + if r == 3 { a[3][c] } else { 0.0 };
+-                    }
+-                }
+-                pose.parts[slot] = pose_body(&w, sp);
++            let Some(i) = *idx else { continue };
++            let local: Option<Mat4> = match view {
++                Some((pa, pc, al)) if i < pa.bones.len() && i < pc.bones.len() => Some(
++                    crate::presentation::blend(Transform::from_matrix(pa.bones[i]), Transform::from_matrix(pc.bones[i]), al).to_matrix(),
++                ),
++                _ => skater.render_pose.get(i).map(|m| crate::animation::native_matrix(*m)),
++            };
++            if let Some(l) = local {
++                let wm = rootm * l;
++                let rows = [wm.x_axis.to_array(), wm.y_axis.to_array(), wm.z_axis.to_array(), wm.w_axis.to_array()];
++                pose.parts[slot] = pose_body(&rows, [sp_i.x, sp_i.y, sp_i.z]);
+             }
+         }
+         b.shared.write_pose(pose);
+@@ -278,12 +292,16 @@ fn bridge(
+     DRIVING_NOW.store(b.driving && in_world && b.origin.is_some(), std::sync::atomic::Ordering::Relaxed);
+     // the Skate camera, in WoW axes: the host drives the client's camera with it
+     if b.driving && in_world {
+-        if let (Some(o), Ok((tf0, proj))) = (b.origin, cameras.single()) {
+-            let mut tf = *tf0;
++        let cam_now: Option<(Transform, f32)> = match view {
++            Some((pa, pc, al)) => Some((crate::presentation::blend(pa.camera, pc.camera, al), pa.fov + (pc.fov - pa.fov) * al)),
++            None => cameras.single().ok().map(|(t, p)| (*t, if let Projection::Perspective(pp) = p { pp.fov } else { 0.87 })),
++        };
++        if let (Some(o), Some((tf0, fov_v))) = (b.origin, cam_now) {
++            let mut tf = tf0;
+             let orbit = ORBIT.lock().map(|g| *g).ok();
+             if let Some(orb) = orbit.filter(|g| g.detached || g.yaw != 0.0 || g.pitch != 0.0 || g.mult != 1.0) {
+                 // orbit the skater: yaw about the world up axis, pitch about the camera's sideways axis, distance scaled
+-                let target = Vec3::new(sp[0], sp[1] + 1.0, sp[2]);
++                let target = Vec3::new(sp_i.x, sp_i.y + 1.0, sp_i.z);
+                 let mut v = tf.translation - target;
+                 v = Quat::from_rotation_y(orb.yaw) * v;
+                 let side = Vec3::new(-v.z, 0.0, v.x).normalize_or_zero();
+@@ -295,7 +313,6 @@ fn bridge(
+             }
+             let wow = |v: Vec3| [v.z, v.x, v.y]; // WoW (X, Y, Z) = Skate (z, x, y)
+             let p = tf.translation;
+-            let fov_v = if let Projection::Perspective(pp) = proj { pp.fov } else { 0.87 };
+             let right = wow(*tf.right());
+             b.shared.write_cam(CamFrame {
+                 frame: b.frame,
+@@ -313,10 +330,10 @@ fn bridge(
+     if b.driving && in_world {
+         if let Some(o) = b.origin {
+             out.flags |= guest_flags::DRIVING;
+-            out.x = o[0] + sp[2] as f64;
+-            out.y = o[1] + sp[0] as f64;
+-            out.z = o[2] + (sp[1] - rest_y) as f64;
+-            out.facing = heading;
++            out.x = o[0] + sp_i.z as f64;
++            out.y = o[1] + sp_i.x as f64;
++            out.z = o[2] + (sp_i.y - rest_y) as f64;
++            out.facing = heading_i;
+         }
+     }
+     b.frame = b.frame.wrapping_add(1);
+-- 
+2.50.1.windows.1
+

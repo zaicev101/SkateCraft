@@ -1,0 +1,65 @@
+From 11aea5b3583f90ed6c36abad566a5bf76eed1e54 Mon Sep 17 00:00:00 2001
+From: zaicev101 <zaicev101@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:44:38 +0300
+Subject: [PATCH 03/15] skatecraft: pull the skater back when the host's
+ collision blocks it
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/wowbridge.rs | 22 ++++++++++++++++++++--
+ 1 file changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index f74d798..2899bb9 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -24,7 +24,7 @@ impl Plugin for WowBridgePlugin {
+             Ok(shared) => {
+                 info!("SkateCraft bridge: shared region ready (F8 toggles driving)");
+                 let driving = std::env::var("SKATECRAFT_DRIVE").as_deref() == Ok("1");
+-                app.insert_resource(Bridge { shared, anchor: None, driving, frame: 0 });
++                app.insert_resource(Bridge { shared, anchor: None, driving, frame: 0, block_seq: 0 });
+                 app.add_systems(Update, bridge);
+             }
+             Err(e) => warn!("SkateCraft bridge: could not open the shared region (error {e})"),
+@@ -45,11 +45,12 @@ struct Bridge {
+     anchor: Option<Anchor>,
+     driving: bool,
+     frame: u32,
++    block_seq: u32,
+ }
+ 
+ fn bridge(
+     mut b: ResMut<Bridge>,
+-    skater: Res<crate::physics::SkaterRuntime>,
++    mut skater: ResMut<crate::physics::SkaterRuntime>,
+     keys: Res<ButtonInput<KeyCode>>,
+ ) {
+     b.shared.set_guest_beat(skatecraft_protocol::process_id(), skatecraft_protocol::tick_ms());
+@@ -65,6 +66,23 @@ fn bridge(
+     let w = b.shared.read_wow();
+     let in_world = w.flags & wow_flags::IN_WORLD != 0;
+ 
++    // the host's collision stopped the character: pull the skater back to where it really is
++    if b.driving && in_world && w.block_seq != b.block_seq {
++        b.block_seq = w.block_seq;
++        if let Some(a) = b.anchor.as_ref() {
++            let (dx, dy) = (w.ax - a.wow[0], w.ay - a.wow[1]);
++            let theta = (a.facing - a.heading) as f64;
++            let (s, c) = (-theta).sin_cos();
++            let (rx, ry) = (dx * c - dy * s, dx * s + dy * c);
++            let pos = [a.skate[0] + ry as f32, sp[1], a.skate[2] + rx as f32];
++            let mut m = [[1.0f32, 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]];
++            m[2] = [heading.sin(), 0., heading.cos(), 0.];
++            m[0] = [heading.cos(), 0., -heading.sin(), 0.];
++            m[3] = [pos[0], pos[1], pos[2], 0.];
++            let _ = skater.travel(m, Some([0.0, 0.0, 0.0]));
++        }
++    }
++
+     let mut out = GuestState { flags: guest_flags::ALIVE, ..Default::default() };
+     if b.driving && in_world {
+         if b.anchor.is_none() {
+-- 
+2.50.1.windows.1
+

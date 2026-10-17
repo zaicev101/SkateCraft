@@ -1,0 +1,167 @@
+From 2801cf4a5358e3fa0c40a99dbe1fd863dde6b63d Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Sat, 17 Oct 2026 12:20:45 +0300
+Subject: [PATCH 12/15] skatecraft: terrain/object tags, camera positioner
+ ignores terrain, pose timestamp
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/camera/collision.rs   |  3 ++-
+ crates/skate-game/src/camera/world_query.rs | 10 ++++++++++
+ crates/skate-game/src/physics.rs            |  2 +-
+ crates/skate-game/src/physics/ground.rs     |  6 +++---
+ crates/skate-game/src/wowbridge.rs          | 20 ++++++++++++++------
+ 5 files changed, 30 insertions(+), 11 deletions(-)
+
+diff --git a/crates/skate-game/src/camera/collision.rs b/crates/skate-game/src/camera/collision.rs
+index 71863c9..dfc62dd 100644
+--- a/crates/skate-game/src/camera/collision.rs
++++ b/crates/skate-game/src/camera/collision.rs
+@@ -41,7 +41,8 @@ impl PositionerCollisionProvider for CameraCollision<'_> {
+         // clone's BoardWorld contains world triangles only, never actor bodies.
+         self.results = [no_hit(); 6];
+         for (result, line) in self.results.iter_mut().zip(lines) {
+-            match super::world_query::line(self.world, line.start, line.end, line.radius) {
++            let bridge = crate::wowbridge::bridge_mode();
++            match super::world_query::line_filtered(self.world, line.start, line.end, line.radius, bridge) {
+                 Ok(hit) => *result = hit,
+                 Err(error) => {
+                     self.error = Some(error.into());
+diff --git a/crates/skate-game/src/camera/world_query.rs b/crates/skate-game/src/camera/world_query.rs
+index cb07fba..9690b8e 100644
+--- a/crates/skate-game/src/camera/world_query.rs
++++ b/crates/skate-game/src/camera/world_query.rs
+@@ -4,6 +4,13 @@ use skate_core::{camera::FatLineResult, math::Vector3,
+     physics::{board_world::BoardWorld, triangle_query::{TriangleLineHit, triangle_segment}}};
+ 
+ pub(super) fn line(world: &BoardWorld, start: [f32; 4], end: [f32; 4], radius: f32)
++    -> Result<FatLineResult, String> {
++    line_filtered(world, start, end, radius, false)
++}
++
++/// `skip_terrain`: ignore tag-0 triangles. SkateCraft's world is WoW's terrain (tag 0) plus buildings/objects (tag 1); the
++/// terrain mesh is bumpy at camera scale and pulled the camera in on every jump, so the camera positioner ignores it.
++pub(super) fn line_filtered(world: &BoardWorld, start: [f32; 4], end: [f32; 4], radius: f32, skip_terrain: bool)
+     -> Result<FatLineResult, String> {
+     if !radius.is_finite() || radius < 0.0 {
+         return Err("Invalid stock camera collision radius".into());
+@@ -13,6 +20,9 @@ pub(super) fn line(world: &BoardWorld, start: [f32; 4], end: [f32; 4], radius: f
+     let mut fraction = f32::MAX;
+     let mut result = no_hit();
+     for (_, entry) in world.line_candidates(start, vector(end), radius) {
++        if skip_terrain && entry.tag == 0 {
++            continue;
++        }
+         let mut hit = TriangleLineHit { position: Vector3::ZERO, normal: Vector3::ZERO,
+             fraction: 0.0, volume_parameter: [0.0; 3] };
+         // Zero triangle fatness and zero material exclusion mask are native.
+diff --git a/crates/skate-game/src/physics.rs b/crates/skate-game/src/physics.rs
+index b183994..09041b7 100644
+--- a/crates/skate-game/src/physics.rs
++++ b/crates/skate-game/src/physics.rs
+@@ -236,7 +236,7 @@ impl GamePhysics {
+         self.world.set_external_queries(queries);
+     }
+     /// SkateCraft: swap the collision world for one built from WoW's geometry (Skate-axis triangles).
+-    pub(crate) fn replace_world(&mut self, tris: &[[skate_core::math::Vector3; 3]]) -> bool {
++    pub(crate) fn replace_world(&mut self, tris: &[([skate_core::math::Vector3; 3], u32)]) -> bool {
+         match ground::world_from_triangles(self.settings.floor_material, tris) {
+             Some(w) => {
+                 self.world = w;
+diff --git a/crates/skate-game/src/physics/ground.rs b/crates/skate-game/src/physics/ground.rs
+index fffc89e..9e68ac5 100644
+--- a/crates/skate-game/src/physics/ground.rs
++++ b/crates/skate-game/src/physics/ground.rs
+@@ -183,13 +183,13 @@ pub(crate) fn flat_world(material: RetailContactMaterial) -> BoardWorld {
+ 
+ /// SkateCraft: a collision world made of arbitrary triangles (WoW's terrain and buildings, already
+ /// in Skate axes). Two-sided, so walls work from either side; `None` when there is nothing.
+-pub(crate) fn world_from_triangles(material: RetailContactMaterial, tris: &[[Vector3; 3]]) -> Option<BoardWorld> {
++pub(crate) fn world_from_triangles(material: RetailContactMaterial, tris: &[([Vector3; 3], u32)]) -> Option<BoardWorld> {
+     let triangles: Vec<WorldTriangle> = tris
+         .iter()
+-        .map(|&vertices| WorldTriangle {
++        .map(|&(vertices, tag)| WorldTriangle {
+             triangle: triangle_from_volume(vertices, 0.0, [1.0; 3], 0),
+             material,
+-            tag: 0,
++            tag,
+         })
+         .collect();
+     if triangles.is_empty() {
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index b75d533..7bd70f2 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -93,6 +93,12 @@ pub(crate) fn filter_input(values: &mut [f32; 18]) {
+     }
+ }
+ 
++/// True when the engine runs as the WoW passthrough guest (`SKATECRAFT_BRIDGE=1`); cached.
++pub(crate) fn bridge_mode() -> bool {
++    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *B.get_or_init(|| std::env::var("SKATECRAFT_BRIDGE").as_deref() == Ok("1"))
++}
++
+ pub struct WowBridgePlugin;
+ 
+ impl Plugin for WowBridgePlugin {
+@@ -154,7 +160,7 @@ fn pose_body(m: &[[f32; 4]; 4], root: [f32; 3]) -> PoseBody {
+ }
+ 
+ /// WoW triangles -> Skate axes around `origin`, normals of floor-like triangles pointing up.
+-fn skate_triangles(patch: &[[f32; 9]], origin: [f64; 3]) -> Vec<[Vector3; 3]> {
++fn skate_triangles(patch: &[[f32; 9]], origin: [f64; 3], terrain: usize) -> Vec<([Vector3; 3], u32)> {
+     let map = |x: f32, y: f32, z: f32| {
+         Vector3::new(
+             (y as f64 - origin[1]) as f32,
+@@ -164,7 +170,9 @@ fn skate_triangles(patch: &[[f32; 9]], origin: [f64; 3]) -> Vec<[Vector3; 3]> {
+     };
+     patch
+         .iter()
+-        .filter_map(|t| {
++        .enumerate()
++        .filter_map(|(i, t)| {
++            let tag = if i < terrain { 0u32 } else { 1u32 }; // 0 = terrain, 1 = buildings and objects
+             let (a, b, c) = (map(t[0], t[1], t[2]), map(t[3], t[4], t[5]), map(t[6], t[7], t[8]));
+             let (u, v) = ([b.x - a.x, b.y - a.y, b.z - a.z], [c.x - a.x, c.y - a.y, c.z - a.z]);
+             let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+@@ -173,7 +181,7 @@ fn skate_triangles(patch: &[[f32; 9]], origin: [f64; 3]) -> Vec<[Vector3; 3]> {
+                 return None;
+             }
+             // floors face up (the skater lands on them); walls are two-sided anyway
+-            Some(if n[1] / len < -0.7 { [a, c, b] } else { [a, b, c] })
++            Some((if n[1] / len < -0.7 { [a, c, b] } else { [a, b, c] }, tag))
+         })
+         .collect()
+ }
+@@ -236,7 +244,7 @@ fn bridge(
+                 let (h, tris) = b.shared.read_patch();
+                 if h.map_id == w.map_id && (h.cx - w.x).hypot(h.cy - w.y) < 25.0 {
+                     let origin = [w.x, w.y, w.z];
+-                    if physics.replace_world(&skate_triangles(&tris, origin)) {
++                    if physics.replace_world(&skate_triangles(&tris, origin, h.terrain_tris as usize)) {
+                         b.origin = Some(origin);
+                         b.world_serial = serial;
+                         let (s, c) = w.facing.sin_cos();
+@@ -251,7 +259,7 @@ fn bridge(
+             let (h, tris) = b.shared.read_patch();
+             if h.map_id == w.map_id {
+                 let origin = b.origin.unwrap();
+-                if physics.replace_world(&skate_triangles(&tris, origin)) {
++                if physics.replace_world(&skate_triangles(&tris, origin, h.terrain_tris as usize)) {
+                     b.world_serial = serial;
+                 }
+             }
+@@ -271,7 +279,7 @@ fn bridge(
+             at("TRAJECTORY"), at("HIPS"), at("SKATEBOARD_ROOT"), at("LEFTFOOT"), at("LEFT_WHEELFRONT"));
+     }
+     if b.driving && in_world && b.origin.is_some() {
+-        let mut pose = PoseFrame { frame: b.frame, nparts: POSE_BONES.len().min(POSE_PARTS) as u32, facing: heading_i, speed: 0.0, ..Default::default() };
++        let mut pose = PoseFrame { frame: b.frame, nparts: POSE_BONES.len().min(POSE_PARTS) as u32, facing: heading_i, speed: 0.0, t_us, ..Default::default() };
+         let rootm = root_i.to_matrix();
+         for (slot, idx) in b.pose_slots.iter().enumerate().take(POSE_PARTS) {
+             let Some(i) = *idx else { continue };
+-- 
+2.50.1.windows.1
+

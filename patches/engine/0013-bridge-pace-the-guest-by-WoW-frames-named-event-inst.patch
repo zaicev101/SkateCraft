@@ -1,0 +1,35 @@
+From 5b1f8153a8021ef7f68aecfd8cdc7a94b0b5fc35 Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Sat, 17 Oct 2026 12:29:35 +0300
+Subject: [PATCH 13/15] bridge: pace the guest by WoW frames (named event)
+ instead of the timer
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/graphics_menu.rs | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/crates/skate-game/src/graphics_menu.rs b/crates/skate-game/src/graphics_menu.rs
+index 61e767c..bcb918b 100644
+--- a/crates/skate-game/src/graphics_menu.rs
++++ b/crates/skate-game/src/graphics_menu.rs
+@@ -1002,6 +1002,16 @@ fn pace(menu: Option<Res<Menu>>, mut pacer: ResMut<FramePacer>) {
+     let Some(menu) = menu else {
+         return;
+     };
++    if crate::wowbridge::bridge_mode() {
++        // lockstep with the WoW client: one guest frame per presented WoW frame (30 ms fallback when WoW is not drawing)
++        let min = Duration::from_millis(14);
++        skatecraft_protocol::frame_wait(30);
++        if let Some(wait) = min.checked_sub(pacer.0.elapsed()) {
++            std::thread::sleep(wait);
++        }
++        pacer.0 = Instant::now();
++        return;
++    }
+     if menu.settings.fps > 0 {
+         let period = Duration::from_secs_f64(1. / f64::from(menu.settings.fps));
+         if let Some(wait) = period.checked_sub(pacer.0.elapsed()) {
+-- 
+2.50.1.windows.1
+

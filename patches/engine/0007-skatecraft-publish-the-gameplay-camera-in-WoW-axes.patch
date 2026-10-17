@@ -1,0 +1,59 @@
+From 1ad144eb20a08290449c4aeaa69ad44349e94ec7 Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Sat, 17 Oct 2026 01:22:47 +0300
+Subject: [PATCH 07/15] skatecraft: publish the gameplay camera in WoW axes
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/wowbridge.rs | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index a55c8ef..d8c346a 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -16,7 +16,7 @@
+ 
+ use bevy::prelude::*;
+ use skate_core::math::Vector3;
+-use skatecraft_protocol::{guest_flags, wow_flags, GuestState, PoseBody, PoseFrame, Shared, POSE_PARTS};
++use skatecraft_protocol::{guest_flags, wow_flags, CamFrame, GuestState, PoseBody, PoseFrame, Shared, POSE_PARTS};
+ 
+ pub struct WowBridgePlugin;
+ 
+@@ -108,6 +108,7 @@ fn bridge(
+     mut skater: ResMut<crate::physics::SkaterRuntime>,
+     mut physics: ResMut<crate::physics::GamePhysics>,
+     keys: Res<ButtonInput<KeyCode>>,
++    cameras: Query<(&Transform, &Projection), With<crate::camera::GameplayCamera>>,
+ ) {
+     b.shared.set_guest_beat(skatecraft_protocol::process_id(), skatecraft_protocol::tick_ms());
+     let w = b.shared.read_wow();
+@@ -198,6 +199,24 @@ fn bridge(
+         }
+         b.shared.write_pose(pose);
+     }
++    // the Skate camera, in WoW axes: the host drives the client's camera with it
++    if b.driving && in_world {
++        if let (Some(o), Ok((tf, proj))) = (b.origin, cameras.single()) {
++            let wow = |v: Vec3| [v.z, v.x, v.y]; // WoW (X, Y, Z) = Skate (z, x, y)
++            let p = tf.translation;
++            let fov_v = if let Projection::Perspective(pp) = proj { pp.fov } else { 0.87 };
++            let right = wow(*tf.right());
++            b.shared.write_cam(CamFrame {
++                frame: b.frame,
++                pos: [o[0] + p.z as f64, o[1] + p.x as f64, o[2] + (p.y - crate::physics::ground::HEIGHT) as f64],
++                fwd: wow(*tf.forward()),
++                left: [-right[0], -right[1], -right[2]],
++                up: wow(*tf.up()),
++                fov_v,
++                ..Default::default()
++            });
++        }
++    }
+     let mut out = GuestState { flags: guest_flags::ALIVE, ..Default::default() };
+     if b.driving && in_world {
+         if let Some(o) = b.origin {
+-- 
+2.50.1.windows.1
+

@@ -1,0 +1,301 @@
+From fdfc9125adf6175b411eaf069f6daddbf87522d6 Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Fri, 16 Oct 2026 22:15:51 +0300
+Subject: [PATCH 05/15] skatecraft: bridge builds the physics world from WoW
+ triangles; flat plane in bridge mode
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/physics.rs        |  12 ++-
+ crates/skate-game/src/physics/ground.rs |  46 ++++++++-
+ crates/skate-game/src/wowbridge.rs      | 122 ++++++++++++++++--------
+ 3 files changed, 138 insertions(+), 42 deletions(-)
+
+diff --git a/crates/skate-game/src/physics.rs b/crates/skate-game/src/physics.rs
+index 7f5a8e7..b183994 100644
+--- a/crates/skate-game/src/physics.rs
++++ b/crates/skate-game/src/physics.rs
+@@ -235,6 +235,16 @@ impl GamePhysics {
+     pub(crate) fn set_external_queries(&mut self, queries: Option<std::sync::Arc<dyn skate_core::physics::board_world::ExternalQueries>>) {
+         self.world.set_external_queries(queries);
+     }
++    /// SkateCraft: swap the collision world for one built from WoW's geometry (Skate-axis triangles).
++    pub(crate) fn replace_world(&mut self, tris: &[[skate_core::math::Vector3; 3]]) -> bool {
++        match ground::world_from_triangles(self.settings.floor_material, tris) {
++            Some(w) => {
++                self.world = w;
++                true
++            }
++            None => false,
++        }
++    }
+     pub(crate) fn world(&self) -> &BoardWorld {
+         &self.world
+     }
+@@ -304,7 +314,7 @@ impl GamePhysics {
+             Some(map) => crate::skate_world::collision_world(map, settings.floor_material)?,
+             None => terrain.world(settings.floor_material),
+         };
+-        let grind_world = std::sync::Arc::new(if map.is_none() && terrain == ground::Terrain::Course {
++        let grind_world = std::sync::Arc::new(if map.is_none() && terrain == ground::Terrain::Course && !ground::bridge_flat() {
+             crate::grind_world::StaticProvider::authored(&crate::grind_world::test_rails())?
+         } else { crate::grind_world::StaticProvider::new(map)? });
+         if let Some(map) = map {
+diff --git a/crates/skate-game/src/physics/ground.rs b/crates/skate-game/src/physics/ground.rs
+index 998dfe9..fffc89e 100644
+--- a/crates/skate-game/src/physics/ground.rs
++++ b/crates/skate-game/src/physics/ground.rs
+@@ -44,6 +44,11 @@ pub(crate) const FLOOR_HEIGHT: f32 = HEIGHT - 1.5;
+ /// Quads use the same winding as the original floor (0,2,1 and 0,3,2).
+ pub(crate) fn surfaces() -> [Vec<[Vector3; 4]>; 4] {
+     let v = Vector3::new;
++    if bridge_flat() {
++        // SkateCraft: the Skate window's own surfaces must not matter; one big neutral plane
++        let r = 5000.0;
++        return [vec![[v(-r, HEIGHT, -r), v(r, HEIGHT, -r), v(r, HEIGHT, r), v(-r, HEIGHT, r)]], vec![], vec![], vec![]];
++    }
+     let floor = vec![[
+         v(-50.0, FLOOR_HEIGHT, -50.0),
+         v(50.0, FLOOR_HEIGHT, -50.0),
+@@ -143,8 +148,15 @@ pub(crate) fn surfaces() -> [Vec<[Vector3; 4]>; 4] {
+     [floor, platform, half_pipe, climbing]
+ }
+ 
++/// True when the engine runs as the WoW passthrough guest (`SKATECRAFT_BRIDGE=1`): the test world
++/// is then a single uniform flat plane with no ramps, platform, pipe or rails.
++pub(crate) fn bridge_flat() -> bool {
++    std::env::var("SKATECRAFT_BRIDGE").as_deref() == Ok("1")
++}
++
+ pub(super) fn world(material: RetailContactMaterial) -> BoardWorld {
+-    build_world(material, surfaces(), query_edges())
++    let edges = if bridge_flat() { Vec::new() } else { query_edges() };
++    build_world(material, surfaces(), edges)
+ }
+ 
+ /// Deliberately authored flat-ground comparison surface. Both the solver and
+@@ -169,6 +181,38 @@ pub(crate) fn flat_world(material: RetailContactMaterial) -> BoardWorld {
+     build_world(material, flat_surfaces(), Vec::new())
+ }
+ 
++/// SkateCraft: a collision world made of arbitrary triangles (WoW's terrain and buildings, already
++/// in Skate axes). Two-sided, so walls work from either side; `None` when there is nothing.
++pub(crate) fn world_from_triangles(material: RetailContactMaterial, tris: &[[Vector3; 3]]) -> Option<BoardWorld> {
++    let triangles: Vec<WorldTriangle> = tris
++        .iter()
++        .map(|&vertices| WorldTriangle {
++            triangle: triangle_from_volume(vertices, 0.0, [1.0; 3], 0),
++            material,
++            tag: 0,
++        })
++        .collect();
++    if triangles.is_empty() {
++        return None;
++    }
++    let metadata = QueryMetadata {
++        packed_surfaces: vec![0u16; triangles.len()],
++        meshes: vec![QueryMesh {
++            triangle_range: 0..triangles.len(),
++            local_to_world: RetailAffineTransform::IDENTITY,
++            world_to_local: RetailAffineTransform::IDENTITY,
++            local_bounds: Bounds::from_points(triangles.iter().flat_map(|entry| entry.triangle.vertices))?,
++            matching_group: -1,
++            rejection_flags: 0,
++            geometry: 1,
++            pool: QueryPool::Ground,
++        }],
++        static_edges: Vec::new(),
++        island_flags: 0,
++    };
++    BoardWorld::with_query_metadata(triangles, metadata).ok()
++}
++
+ fn build_world(
+     material: RetailContactMaterial,
+     surfaces: [Vec<[Vector3; 4]>; 4],
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index 77cf791..4297726 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -4,13 +4,18 @@
+ //! and moves the character to wherever this side says. Enabled only when the environment
+ //! variable `SKATECRAFT_BRIDGE=1` is set, so a normal run is unchanged. F8 toggles driving.
+ //!
++//! WoW decides the surface, Skate decides the physics: the host cuts a patch of WoW's terrain and
++//! building triangles around the player and publishes it; this side builds its collision world from
++//! it (the demo world is a single flat plane, only used before skate mode starts).
++//!
+ //! Mapping between the two worlds: 1 Skate metre = 1 WoW yard. WoW is X north, Y west, Z up;
+ //! Skate is X, Y up, Z. The map `wow = (z, x, y)` is a cyclic permutation (right-handed to
+ //! right-handed), and both headings come out as `atan2(forward.x, forward.z)`, so the skater's
+-//! facing is the character's facing. When driving starts, the skater's current spot is
+-//! anchored to the character's current spot and facing; everything after is relative.
++//! facing is the character's facing. When driving starts, the skater is placed on the character's
++//! spot and facing (origin = that spot, ground = the plane height); everything after is relative.
+ 
+ use bevy::prelude::*;
++use skate_core::math::Vector3;
+ use skatecraft_protocol::{guest_flags, wow_flags, GuestState, Shared};
+ 
+ pub struct WowBridgePlugin;
+@@ -24,7 +29,7 @@ impl Plugin for WowBridgePlugin {
+             Ok(shared) => {
+                 info!("SkateCraft bridge: shared region ready (F8 toggles driving)");
+                 let driving = std::env::var("SKATECRAFT_DRIVE").as_deref() == Ok("1");
+-                app.insert_resource(Bridge { shared, anchor: None, driving, frame: 0, block_seq: 0 });
++                app.insert_resource(Bridge { shared, origin: None, rest_y: None, driving, frame: 0, seen_serial: 0, world_serial: 0 });
+                 app.add_systems(Update, bridge);
+             }
+             Err(e) => warn!("SkateCraft bridge: could not open the shared region (error {e})"),
+@@ -32,25 +37,50 @@ impl Plugin for WowBridgePlugin {
+     }
+ }
+ 
+-struct Anchor {
+-    skate: [f32; 3],
+-    heading: f32,
+-    wow: [f64; 3],
+-    facing: f32,
+-}
+-
+ #[derive(Resource)]
+ struct Bridge {
+     shared: Shared,
+-    anchor: Option<Anchor>,
++    /// WoW position the Skate origin stands for
++    origin: Option<[f64; 3]>,
++    /// root height of the skater resting on the plane
++    rest_y: Option<f32>,
+     driving: bool,
+     frame: u32,
+-    block_seq: u32,
++    /// last patch serial looked at while waiting to anchor
++    seen_serial: u32,
++    /// serial of the patch the physics world was built from
++    world_serial: u32,
++}
++
++/// WoW triangles -> Skate axes around `origin`, normals of floor-like triangles pointing up.
++fn skate_triangles(patch: &[[f32; 9]], origin: [f64; 3]) -> Vec<[Vector3; 3]> {
++    let map = |x: f32, y: f32, z: f32| {
++        Vector3::new(
++            (y as f64 - origin[1]) as f32,
++            (z as f64 - origin[2]) as f32 + crate::physics::ground::HEIGHT,
++            (x as f64 - origin[0]) as f32,
++        )
++    };
++    patch
++        .iter()
++        .filter_map(|t| {
++            let (a, b, c) = (map(t[0], t[1], t[2]), map(t[3], t[4], t[5]), map(t[6], t[7], t[8]));
++            let (u, v) = ([b.x - a.x, b.y - a.y, b.z - a.z], [c.x - a.x, c.y - a.y, c.z - a.z]);
++            let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
++            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
++            if len < 1e-5 {
++                return None;
++            }
++            // floors face up (the skater lands on them); walls are two-sided anyway
++            Some(if n[1] / len < -0.7 { [a, c, b] } else { [a, b, c] })
++        })
++        .collect()
+ }
+ 
+ fn bridge(
+     mut b: ResMut<Bridge>,
+     mut skater: ResMut<crate::physics::SkaterRuntime>,
++    mut physics: ResMut<crate::physics::GamePhysics>,
+     keys: Res<ButtonInput<KeyCode>>,
+ ) {
+     b.shared.set_guest_beat(skatecraft_protocol::process_id(), skatecraft_protocol::tick_ms());
+@@ -60,48 +90,60 @@ fn bridge(
+     let wanted = forced || w.flags & wow_flags::SKATE_ON != 0 || keys.pressed(KeyCode::F8);
+     if wanted != b.driving {
+         b.driving = wanted;
+-        b.anchor = None;
++        b.origin = None;
++        b.seen_serial = 0;
+         info!("SkateCraft bridge: driving {}", if b.driving { "on" } else { "off" });
+     }
+ 
+     let root = skater.animated_skeleton.roots.animation_to_world;
+     let sp = [root[3][0], root[3][1], root[3][2]];
+     let heading = root[2][0].atan2(root[2][2]);
++    if b.rest_y.is_none() {
++        b.rest_y = Some(sp[1]);
++    }
++    let rest_y = b.rest_y.unwrap();
+     let in_world = w.flags & wow_flags::IN_WORLD != 0;
+ 
+-    // the host's collision stopped the character: pull the skater back to where it really is
+-    if b.driving && in_world && w.block_seq != b.block_seq {
+-        b.block_seq = w.block_seq;
+-        if let Some(a) = b.anchor.as_ref() {
+-            let (dx, dy) = (w.ax - a.wow[0], w.ay - a.wow[1]);
+-            let theta = (a.facing - a.heading) as f64;
+-            let (s, c) = (-theta).sin_cos();
+-            let (rx, ry) = (dx * c - dy * s, dx * s + dy * c);
+-            let pos = [a.skate[0] + ry as f32, sp[1], a.skate[2] + rx as f32];
+-            let mut m = [[1.0f32, 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]];
+-            m[2] = [heading.sin(), 0., heading.cos(), 0.];
+-            m[0] = [heading.cos(), 0., -heading.sin(), 0.];
+-            m[3] = [pos[0], pos[1], pos[2], 0.];
+-            let _ = skater.travel(m, Some([0.0, 0.0, 0.0]));
++    if b.driving && in_world {
++        // anchor once a patch around the character is available
++        if b.origin.is_none() {
++            let serial = b.shared.patch_serial();
++            if serial != 0 && serial != b.seen_serial {
++                b.seen_serial = serial;
++                let (h, tris) = b.shared.read_patch();
++                if h.map_id == w.map_id && (h.cx - w.x).hypot(h.cy - w.y) < 25.0 {
++                    let origin = [w.x, w.y, w.z];
++                    if physics.replace_world(&skate_triangles(&tris, origin)) {
++                        b.origin = Some(origin);
++                        b.world_serial = serial;
++                        let (s, c) = w.facing.sin_cos();
++                        let m = [[c, 0., -s, 0.], [0., 1., 0., 0.], [s, 0., c, 0.], [0., rest_y, 0., 0.]];
++                        let _ = skater.travel(m, Some([0.0, 0.0, 0.0]));
++                        info!("SkateCraft bridge: anchored on WoW map {} with {} triangles", w.map_id, tris.len());
++                    }
++                }
++            }
++        } else if b.shared.patch_serial() != b.world_serial {
++            let serial = b.shared.patch_serial();
++            let (h, tris) = b.shared.read_patch();
++            if h.map_id == w.map_id {
++                let origin = b.origin.unwrap();
++                if physics.replace_world(&skate_triangles(&tris, origin)) {
++                    b.world_serial = serial;
++                }
++            }
+         }
+     }
+ 
+     let mut out = GuestState { flags: guest_flags::ALIVE, ..Default::default() };
+     if b.driving && in_world {
+-        if b.anchor.is_none() {
+-            b.anchor = Some(Anchor { skate: sp, heading, wow: [w.x, w.y, w.z], facing: w.facing });
++        if let Some(o) = b.origin {
++            out.flags |= guest_flags::DRIVING;
++            out.x = o[0] + sp[2] as f64;
++            out.y = o[1] + sp[0] as f64;
++            out.z = o[2] + (sp[1] - rest_y) as f64;
++            out.facing = heading;
+         }
+-        let a = b.anchor.as_ref().unwrap();
+-        // displacement in WoW axes (X = skate z, Y = skate x), rotated by the facing difference
+-        let dx = (sp[2] - a.skate[2]) as f64;
+-        let dy = (sp[0] - a.skate[0]) as f64;
+-        let theta = (a.facing - a.heading) as f64;
+-        let (s, c) = theta.sin_cos();
+-        out.flags |= guest_flags::DRIVING;
+-        out.x = a.wow[0] + dx * c - dy * s;
+-        out.y = a.wow[1] + dx * s + dy * c;
+-        out.z = a.wow[2] + (sp[1] - a.skate[1]) as f64;
+-        out.facing = heading + a.facing - a.heading;
+     }
+     b.frame = b.frame.wrapping_add(1);
+     out.frame = b.frame;
+-- 
+2.50.1.windows.1
+

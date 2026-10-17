@@ -1,0 +1,40 @@
+From 75352ca29a97857cbab46c726b6ed4c64ed0a45a Mon Sep 17 00:00:00 2001
+From: zaicev101 <zaicev101@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:54:56 +0300
+Subject: [PATCH 04/15] skatecraft: driving follows the host's skate-mode flag
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/wowbridge.rs | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index 2899bb9..77cf791 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -54,8 +54,12 @@ fn bridge(
+     keys: Res<ButtonInput<KeyCode>>,
+ ) {
+     b.shared.set_guest_beat(skatecraft_protocol::process_id(), skatecraft_protocol::tick_ms());
+-    if keys.just_pressed(KeyCode::F8) {
+-        b.driving = !b.driving;
++    let w = b.shared.read_wow();
++    // skate mode is switched from inside WoW (the SkateCraft addon); F8 only forces it for tests
++    let forced = std::env::var("SKATECRAFT_DRIVE").as_deref() == Ok("1");
++    let wanted = forced || w.flags & wow_flags::SKATE_ON != 0 || keys.pressed(KeyCode::F8);
++    if wanted != b.driving {
++        b.driving = wanted;
+         b.anchor = None;
+         info!("SkateCraft bridge: driving {}", if b.driving { "on" } else { "off" });
+     }
+@@ -63,7 +67,6 @@ fn bridge(
+     let root = skater.animated_skeleton.roots.animation_to_world;
+     let sp = [root[3][0], root[3][1], root[3][2]];
+     let heading = root[2][0].atan2(root[2][2]);
+-    let w = b.shared.read_wow();
+     let in_world = w.flags & wow_flags::IN_WORLD != 0;
+ 
+     // the host's collision stopped the character: pull the skater back to where it really is
+-- 
+2.50.1.windows.1
+

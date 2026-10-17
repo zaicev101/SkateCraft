@@ -1,0 +1,115 @@
+From d1725df1ca0be1d84c70f7d0e3afbf9c94aa15b3 Mon Sep 17 00:00:00 2001
+From: unknown <Lordbastion>
+Date: Sat, 17 Oct 2026 01:43:46 +0300
+Subject: [PATCH 08/15] skatecraft: L3+R3 toggles a detached camera (right
+ stick orbits, LB/RB distance); tricks are withheld while detached
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ crates/skate-game/src/input.rs     |  1 +
+ crates/skate-game/src/wowbridge.rs | 68 +++++++++++++++++++++++++++++-
+ 2 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/crates/skate-game/src/input.rs b/crates/skate-game/src/input.rs
+index 3c072f7..c3b2c89 100644
+--- a/crates/skate-game/src/input.rs
++++ b/crates/skate-game/src/input.rs
+@@ -148,6 +148,7 @@ pub(crate) fn publish_actions(
+     let tick = input.tick_input();
+     let mut values=*tick.actions().values();
+     if !blocked { crate::modding::override_actions(mods.as_deref(), &mut values); }
++    crate::wowbridge::filter_input(&mut values);
+     let tick=TickInput::new(tick.tick(),skate_core::input::gameplay_map::GameplayActions::from_values(values),tick.controller_available());
+     published.0 = if debug.suppress_gameplay(&camera) {
+         TickInput::new(
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+index d8c346a..d534733 100644
+--- a/crates/skate-game/src/wowbridge.rs
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -18,6 +18,57 @@ use bevy::prelude::*;
+ use skate_core::math::Vector3;
+ use skatecraft_protocol::{guest_flags, wow_flags, CamFrame, GuestState, PoseBody, PoseFrame, Shared, POSE_PARTS};
+ 
++/// The player-controlled camera offset (L3 + R3 on the pad toggles it): yaw, pitch, distance multiplier.
++#[derive(Clone, Copy)]
++struct Orbit {
++    detached: bool,
++    yaw: f32,
++    pitch: f32,
++    mult: f32,
++    combo: bool,
++    last: Option<std::time::Instant>,
++}
++
++static ORBIT: std::sync::Mutex<Orbit> = std::sync::Mutex::new(Orbit { detached: false, yaw: 0.0, pitch: 0.0, mult: 1.0, combo: false, last: None });
++static DRIVING_NOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++/// Gameplay action values (ids 64..81, see `skate_core::input::gameplay_map`): L3 + R3 together toggles the detached
++/// camera; while detached, the right stick orbits the skater, LB/RB change the distance, and the right-stick / bumper
++/// inputs are withheld from the game (so orbiting never throws a trick).
++pub(crate) fn filter_input(values: &mut [f32; 18]) {
++    if !DRIVING_NOW.load(std::sync::atomic::Ordering::Relaxed) {
++        return;
++    }
++    let Ok(mut o) = ORBIT.lock() else { return };
++    let now = std::time::Instant::now();
++    let dt = o.last.map_or(0.016, |t| now.duration_since(t).as_secs_f32()).clamp(0.0, 0.1);
++    o.last = Some(now);
++    let combo = values[66 - 64] > 0.5 && values[69 - 64] > 0.5;
++    if combo && !o.combo {
++        o.detached = !o.detached;
++        if !o.detached {
++            o.yaw = 0.0;
++            o.pitch = 0.0;
++            o.mult = 1.0;
++        }
++    }
++    o.combo = combo;
++    if o.detached || combo {
++        let (rx, ry) = (values[67 - 64], values[68 - 64]);
++        let dead = |v: f32| if v.abs() < 0.15 { 0.0 } else { v };
++        o.yaw -= dead(rx) * dt * 2.2;
++        o.pitch += dead(ry) * dt * 1.6;
++        o.pitch = o.pitch.clamp(-1.2, 1.2);
++        o.yaw = o.yaw.clamp(-3.2, 3.2);
++        if values[73 - 64] > 0.5 { o.mult *= (-dt * 1.2).exp(); }
++        if values[72 - 64] > 0.5 { o.mult *= (dt * 1.2).exp(); }
++        o.mult = o.mult.clamp(0.25, 4.0);
++        for id in [66, 67, 68, 69, 72, 73] {
++            values[id - 64] = 0.0;
++        }
++    }
++}
++
+ pub struct WowBridgePlugin;
+ 
+ impl Plugin for WowBridgePlugin {
+@@ -199,9 +250,24 @@ fn bridge(
+         }
+         b.shared.write_pose(pose);
+     }
++    DRIVING_NOW.store(b.driving && in_world && b.origin.is_some(), std::sync::atomic::Ordering::Relaxed);
+     // the Skate camera, in WoW axes: the host drives the client's camera with it
+     if b.driving && in_world {
+-        if let (Some(o), Ok((tf, proj))) = (b.origin, cameras.single()) {
++        if let (Some(o), Ok((tf0, proj))) = (b.origin, cameras.single()) {
++            let mut tf = *tf0;
++            let orbit = ORBIT.lock().map(|g| *g).ok();
++            if let Some(orb) = orbit.filter(|g| g.detached || g.yaw != 0.0 || g.pitch != 0.0 || g.mult != 1.0) {
++                // orbit the skater: yaw about the world up axis, pitch about the camera's sideways axis, distance scaled
++                let target = Vec3::new(sp[0], sp[1] + 1.0, sp[2]);
++                let mut v = tf.translation - target;
++                v = Quat::from_rotation_y(orb.yaw) * v;
++                let side = Vec3::new(-v.z, 0.0, v.x).normalize_or_zero();
++                if side != Vec3::ZERO {
++                    v = Quat::from_axis_angle(side, -orb.pitch) * v;
++                }
++                tf.translation = target + v * orb.mult;
++                tf = tf.looking_at(target, Vec3::Y);
++            }
+             let wow = |v: Vec3| [v.z, v.x, v.y]; // WoW (X, Y, Z) = Skate (z, x, y)
+             let p = tf.translation;
+             let fov_v = if let Projection::Perspective(pp) = proj { pp.fov } else { 0.87 };
+-- 
+2.50.1.windows.1
+

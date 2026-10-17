@@ -1,0 +1,171 @@
+From 63d797143c54c40373980c6fe140dd7cebd1845c Mon Sep 17 00:00:00 2001
+From: zaicev101 <zaicev101@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 21:16:36 +0300
+Subject: [PATCH 01/15] skatecraft: WoW bridge plugin (shared memory, F8
+ toggles driving)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ Cargo.lock                         |  8 +++
+ crates/skate-game/Cargo.toml       |  1 +
+ crates/skate-game/src/app.rs       |  1 +
+ crates/skate-game/src/main.rs      |  1 +
+ crates/skate-game/src/wowbridge.rs | 87 ++++++++++++++++++++++++++++++
+ 5 files changed, 98 insertions(+)
+ create mode 100644 crates/skate-game/src/wowbridge.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 8d34d49..3be0ba6 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4895,6 +4895,7 @@ dependencies = [
+  "skate-dynamics",
+  "skate-mods",
+  "skate-net",
++ "skatecraft-protocol",
+  "wgpu",
+ ]
+ 
+@@ -4932,6 +4933,13 @@ dependencies = [
+  "steamworks",
+ ]
+ 
++[[package]]
++name = "skatecraft-protocol"
++version = "0.1.0"
++dependencies = [
++ "windows-sys 0.61.2",
++]
++
+ [[package]]
+ name = "skrifa"
+ version = "0.39.0"
+diff --git a/crates/skate-game/Cargo.toml b/crates/skate-game/Cargo.toml
+index 5074ded..611106e 100644
+--- a/crates/skate-game/Cargo.toml
++++ b/crates/skate-game/Cargo.toml
+@@ -33,6 +33,7 @@ serde.workspace = true
+ blake3 = "=1.8.7"
+ image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
+ skate-mods = { path = "../skate-mods" }
++skatecraft-protocol = { path = "../../../../crates/protocol" }
+ skate-dynamics = { path = "../skate-dynamics" }
+ skate-audio = { path = "../skate-audio" }
+ gltf = { version = "=1.4.1", default-features = true }
+diff --git a/crates/skate-game/src/app.rs b/crates/skate-game/src/app.rs
+index 900ce5f..504ae5d 100644
+--- a/crates/skate-game/src/app.rs
++++ b/crates/skate-game/src/app.rs
+@@ -140,6 +140,7 @@ pub(crate) fn build(
+     app.add_plugins(crate::trigger_volumes::TriggerVolumesPlugin);
+     app.add_plugins(crate::retail_menus::RetailMenusPlugin);
+     app.add_plugins(crate::modding::ModdingPlugin);
++    app.add_plugins(crate::wowbridge::WowBridgePlugin);
+     crate::teleport_menu::install(&mut app);
+     app.add_plugins(crate::updater::UpdaterPlugin);
+     app.add_plugins(crate::multiplayer::MultiplayerPlugin);
+diff --git a/crates/skate-game/src/main.rs b/crates/skate-game/src/main.rs
+index 54f4bd2..82bffb0 100644
+--- a/crates/skate-game/src/main.rs
++++ b/crates/skate-game/src/main.rs
+@@ -1,3 +1,4 @@
++mod wowbridge;
+ mod frame_timing;
+ mod animation;
+ mod crash_report;
+diff --git a/crates/skate-game/src/wowbridge.rs b/crates/skate-game/src/wowbridge.rs
+new file mode 100644
+index 0000000..7e9ca1c
+--- /dev/null
++++ b/crates/skate-game/src/wowbridge.rs
+@@ -0,0 +1,87 @@
++//! SkateCraft bridge: lets a World of Warcraft 3.3.5a client use this skater as its player.
++//!
++//! The WoW side (a plugin inside the client) publishes the player's position in shared memory
++//! and moves the character to wherever this side says. Enabled only when the environment
++//! variable `SKATECRAFT_BRIDGE=1` is set, so a normal run is unchanged. F8 toggles driving.
++//!
++//! Mapping between the two worlds: 1 Skate metre = 1 WoW yard. WoW is X north, Y west, Z up;
++//! Skate is X, Y up, Z. The map `wow = (z, x, y)` is a cyclic permutation (right-handed to
++//! right-handed), and both headings come out as `atan2(forward.x, forward.z)`, so the skater's
++//! facing is the character's facing. When driving starts, the skater's current spot is
++//! anchored to the character's current spot and facing; everything after is relative.
++
++use bevy::prelude::*;
++use skatecraft_protocol::{guest_flags, wow_flags, GuestState, Shared};
++
++pub struct WowBridgePlugin;
++
++impl Plugin for WowBridgePlugin {
++    fn build(&self, app: &mut App) {
++        if std::env::var("SKATECRAFT_BRIDGE").as_deref() != Ok("1") {
++            return;
++        }
++        match Shared::create() {
++            Ok(shared) => {
++                info!("SkateCraft bridge: shared region ready (F8 toggles driving)");
++                app.insert_resource(Bridge { shared, anchor: None, driving: false, frame: 0 });
++                app.add_systems(Update, bridge);
++            }
++            Err(e) => warn!("SkateCraft bridge: could not open the shared region (error {e})"),
++        }
++    }
++}
++
++struct Anchor {
++    skate: [f32; 3],
++    heading: f32,
++    wow: [f64; 3],
++    facing: f32,
++}
++
++#[derive(Resource)]
++struct Bridge {
++    shared: Shared,
++    anchor: Option<Anchor>,
++    driving: bool,
++    frame: u32,
++}
++
++fn bridge(
++    mut b: ResMut<Bridge>,
++    skater: Res<crate::physics::SkaterRuntime>,
++    keys: Res<ButtonInput<KeyCode>>,
++) {
++    b.shared.set_guest_beat(skatecraft_protocol::process_id(), skatecraft_protocol::tick_ms());
++    if keys.just_pressed(KeyCode::F8) {
++        b.driving = !b.driving;
++        b.anchor = None;
++        info!("SkateCraft bridge: driving {}", if b.driving { "on" } else { "off" });
++    }
++
++    let root = skater.animated_skeleton.roots.animation_to_world;
++    let sp = [root[3][0], root[3][1], root[3][2]];
++    let heading = root[2][0].atan2(root[2][2]);
++    let w = b.shared.read_wow();
++    let in_world = w.flags & wow_flags::IN_WORLD != 0;
++
++    let mut out = GuestState { flags: guest_flags::ALIVE, ..Default::default() };
++    if b.driving && in_world {
++        if b.anchor.is_none() {
++            b.anchor = Some(Anchor { skate: sp, heading, wow: [w.x, w.y, w.z], facing: w.facing });
++        }
++        let a = b.anchor.as_ref().unwrap();
++        // displacement in WoW axes (X = skate z, Y = skate x), rotated by the facing difference
++        let dx = (sp[2] - a.skate[2]) as f64;
++        let dy = (sp[0] - a.skate[0]) as f64;
++        let theta = (a.facing - a.heading) as f64;
++        let (s, c) = theta.sin_cos();
++        out.flags |= guest_flags::DRIVING;
++        out.x = a.wow[0] + dx * c - dy * s;
++        out.y = a.wow[1] + dx * s + dy * c;
++        out.z = a.wow[2] + (sp[1] - a.skate[1]) as f64;
++        out.facing = heading + a.facing - a.heading;
++    }
++    b.frame = b.frame.wrapping_add(1);
++    out.frame = b.frame;
++    b.shared.write_guest(out);
++}
+-- 
+2.50.1.windows.1
+
