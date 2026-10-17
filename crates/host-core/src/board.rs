@@ -568,7 +568,9 @@ unsafe extern "system" fn end_scene(dev: usize) -> Hr {
     PERSP_DRAWS.store(0, Ordering::Relaxed);
     LAST_KIND.store(0, Ordering::Relaxed);
     let orig: unsafe extern "system" fn(usize) -> Hr = core::mem::transmute(ORIG.load(Ordering::Relaxed) as usize);
-    orig(dev)
+    let r = orig(dev);
+    skatecraft_protocol::frame_signal();
+    r
 }
 
 pub unsafe fn install() -> bool {

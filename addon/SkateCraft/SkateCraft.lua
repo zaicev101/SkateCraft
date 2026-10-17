@@ -52,6 +52,26 @@ local function unstow()
     end
 end
 
+-- The Skate engine runs in lockstep with the client's frames; a fixed frame rate keeps both even.
+local SKATE_FPS = "60"
+local savedFps
+
+local function capFps()
+    if not savedFps then
+        savedFps = { GetCVar("maxfps"), GetCVar("maxfpsbk") }
+    end
+    SetCVar("maxfps", SKATE_FPS)
+    SetCVar("maxfpsbk", SKATE_FPS)
+end
+
+local function restoreFps()
+    if savedFps then
+        SetCVar("maxfps", savedFps[1])
+        SetCVar("maxfpsbk", savedFps[2])
+        savedFps = nil
+    end
+end
+
 local function refresh()
     button:SetText(on and "Skate: ON" or "Skate: off")
 end
@@ -60,7 +80,7 @@ local function set(state)
     local was = on
     on = state and true or false
     elapsed = 0
-    if on and not was then stow() elseif was and not on then unstow() end
+    if on and not was then stow() capFps() elseif was and not on then unstow() restoreFps() end
     send(on)
     refresh()
     DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffSkateCraft|r: skate mode " .. (on and "ON" or "off"))
@@ -92,6 +112,6 @@ end
 
 local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGOUT")
-f:SetScript("OnEvent", function() if on then send(false) end end)
+f:SetScript("OnEvent", function() if on then send(false) end restoreFps() end)
 
 refresh()

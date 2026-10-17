@@ -452,3 +452,28 @@ mod tests {
         assert_eq!(o.header().wow_pid, 11);
     }
 }
+
+/// Frame-sync event: the WoW side signals it once per presented frame, the guest waits on it instead of its own timer.
+#[cfg(windows)]
+fn frame_event() -> windows_sys::Win32::Foundation::HANDLE {
+    use std::sync::OnceLock;
+    static H: OnceLock<isize> = OnceLock::new();
+    *H.get_or_init(|| unsafe {
+        let name = Shared::wide(r"Local\SkateCraft_frame");
+        windows_sys::Win32::System::Threading::CreateEventW(ptr::null(), 0, 0, name.as_ptr()) as isize
+    }) as _
+}
+
+/// WoW side: a frame was presented.
+#[cfg(windows)]
+pub fn frame_signal() {
+    unsafe {
+        windows_sys::Win32::System::Threading::SetEvent(frame_event());
+    }
+}
+
+/// Guest side: wait for the next WoW frame (true) or give up after `ms` (false).
+#[cfg(windows)]
+pub fn frame_wait(ms: u32) -> bool {
+    unsafe { windows_sys::Win32::System::Threading::WaitForSingleObject(frame_event(), ms) == 0 }
+}
