@@ -52,30 +52,17 @@ local function unstow()
     end
 end
 
--- The Skate engine runs in lockstep with the client's frames; a fixed frame rate keeps both even.
-local SKATE_FPS = "60"
-local savedFps
-
+-- The Skate engine runs in lockstep with the client's frames. A fixed frame cap (60) beats against a 165 Hz display
+-- and makes every few frames last twice as long, so the client is left uncapped and vertical sync paces it.
 local function capFps()
-    -- vertical sync: every client frame lands on a display refresh, the Skate engine follows those frames
     if GetCVar("gxVSync") ~= "1" then
         -- never restart the graphics from a script: the whole UI is rebuilt under it (the client crashes)
         SetCVar("gxVSync", "1")
         DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffSkateCraft|r: vertical sync is set; restart the game once for it to apply")
     end
-    if not savedFps then
-        savedFps = { GetCVar("maxfps"), GetCVar("maxfpsbk") }
-    end
-    SetCVar("maxfps", SKATE_FPS)
-    SetCVar("maxfpsbk", SKATE_FPS)
 end
 
 local function restoreFps()
-    if savedFps then
-        SetCVar("maxfps", savedFps[1])
-        SetCVar("maxfpsbk", savedFps[2])
-        savedFps = nil
-    end
 end
 
 local function refresh()
