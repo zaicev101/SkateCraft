@@ -59,8 +59,9 @@ local savedFps
 local function capFps()
     -- vertical sync: every client frame lands on a display refresh, the Skate engine follows those frames
     if GetCVar("gxVSync") ~= "1" then
+        -- never restart the graphics from a script: the whole UI is rebuilt under it (the client crashes)
         SetCVar("gxVSync", "1")
-        RestartGx()
+        DEFAULT_CHAT_FRAME:AddMessage("|cff66ccffSkateCraft|r: vertical sync is set; restart the game once for it to apply")
     end
     if not savedFps then
         savedFps = { GetCVar("maxfps"), GetCVar("maxfpsbk") }
